@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-create-bucket
+  namespace: kserve-lab
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          envFrom:
+            - secretRef:
+                name: minio-root-credentials
+          command:
+            - /bin/sh
+            - -c
+            - |
+              mc alias set local http://minio.kserve-lab.svc.cluster.local:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" &&
+              mc mb --ignore-existing local/models &&
+              mc mb --ignore-existing local/mlflow

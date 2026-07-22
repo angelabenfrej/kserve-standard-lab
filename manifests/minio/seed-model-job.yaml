@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-seed-model
+  namespace: kserve-lab
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: download
+          image: curlimages/curl:latest
+          command:
+            - sh
+            - -c
+            - curl -sSL -o /work/model.joblib https://storage.googleapis.com/kfserving-examples/models/sklearn/1.0/model/model.joblib
+          volumeMounts:
+            - name: work
+              mountPath: /work
+      containers:
+        - name: upload
+          image: minio/mc:latest
+          envFrom:
+            - secretRef:
+                name: minio-root-credentials
+          command:
+            - sh
+            - -c
+            - |
+              mc alias set local http://minio.kserve-lab.svc.cluster.local:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" &&
+              mc cp /work/model.joblib local/models/sklearn-iris/model.joblib
+          volumeMounts:
+            - name: work
+              mountPath: /work
+      volumes:
+        - name: work
+          emptyDir: {}

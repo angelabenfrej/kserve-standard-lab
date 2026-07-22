@@ -1,0 +1,11 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: sklearn-iris-mlflow
+spec:
+  predictor:
+    serviceAccountName: kserve-s3-sa
+    model:
+      modelFormat:
+        name: sklearn
+      storageUri: "s3://mlflow/1/models/m-e2e6777387084ae9b579bf424f617bd6/artifacts"

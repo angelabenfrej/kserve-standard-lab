@@ -1,0 +1,28 @@
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: custom-sklearn-runtime
+  namespace: default
+spec:
+  supportedModelFormats:
+    - name: sklearn
+      version: "1"
+      autoSelect: true
+      priority: 1
+  protocolVersions:
+    - v1
+  containers:
+    - name: kserve-container
+      image: custom-sklearn-runtime:latest
+      imagePullPolicy: Never
+      args:
+        - --model_name={{.Name}}
+        - --model_dir=/mnt/models
+        - --http_port=8080
+      resources:
+        requests:
+          cpu: "100m"
+          memory: 256Mi
+        limits:
+          cpu: "500m"
+          memory: 512Mi
