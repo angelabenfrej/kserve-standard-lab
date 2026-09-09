@@ -20,10 +20,11 @@ Stack: k3d · KServe (Standard/RawDeployment mode) · MinIO · PostgreSQL · MLf
 ## Repository layout
 
 ```
-k3d/               k3d cluster config
+k3d/               k3d cluster configs (CPU: cluster.yaml, GPU: cluster-gpu.yaml)
 manifests/         Kubernetes manifests (MinIO, PostgreSQL, MLflow, ServingRuntimes, InferenceServices)
 mlflow/            custom MLflow server image (Dockerfile)
 custom-runtime/    custom KServe ServingRuntime image (Dockerfile + server)
+gpu/               CUDA-enabled k3s node image, RuntimeClass, NVIDIA device plugin
 train/             local training script and environment config
 Makefile           up / down / reset targets consolidating all steps
 ```
@@ -577,3 +578,135 @@ Training (Step 5) and the smoke-test `InferenceService`s are intentionally **not
 part of `up`; they're interactive exercises (local venv, foreground port-forwards),
 not infrastructure. `up` gets the lab ready to use; training/serving a model is a
 manual walkthrough, documented above.
+
+---
+
+## Step 8: GPU passthrough and LLM serving
+
+Everything above runs on CPU. Serving an LLM needs the host GPU visible to a pod,
+which under k3d means threading it through four layers, each of which fails
+silently and independently:
+
+```
+host NVIDIA driver
+  -> Docker `nvidia` runtime           (nvidia-container-toolkit, on the host)
+  -> containerd inside the k3s node    (custom node image, gpu/Dockerfile)
+  -> kubelet advertises nvidia.com/gpu (device plugin DaemonSet)
+  -> pod requests it                   (resources.limits + runtimeClassName)
+```
+
+### 8a: host: NVIDIA Container Toolkit
+
+Gives Docker an `nvidia` runtime, so `--gpus` can pass the card into a container.
+The repo is distribution-agnostic: use the `amd64` path, not a codename (there is
+no `resolute` build for Ubuntu 26.04).
+
+```bash
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+K=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+U=https://nvidia.github.io/libnvidia-container/stable/deb/amd64
+echo "deb [signed-by=$K] $U /" | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+**Verify:**
+```bash
+docker info | grep -A2 Runtimes            # expect `nvidia` alongside runc
+docker run --rm --gpus all nvidia/cuda:13.0.1-base-ubuntu24.04 nvidia-smi
+```
+
+### 8b: CUDA-enabled k3s node image
+
+k3d runs each node as a Docker container. Passing `--gpus all` gives the *node
+container* the card, but containerd inside it still cannot hand `/dev/nvidia*` to a
+pod, because the stock `rancher/k3s` image carries no NVIDIA container runtime.
+[`gpu/Dockerfile`](gpu/Dockerfile) fixes that: CUDA base image, plus the toolkit,
+with the k3s filesystem overlaid on top. k3s then detects
+`nvidia-container-runtime` on PATH at boot and registers it with containerd as a
+runtime handler named `nvidia`.
+
+Requires BuildKit (the `COPY --exclude` in the Dockerfile); on Docker 29 that means
+the `buildx` plugin, installable without root into `~/.docker/cli-plugins/`.
+
+```bash
+docker build --load -t k3s-cuda:v1.35.5-k3s1 gpu/
+```
+
+**Verify:**
+```bash
+docker exec k3d-kserve-lab-agent-0 \
+  grep -A3 "runtimes.'nvidia'" /var/lib/rancher/k3s/agent/etc/containerd/config.toml
+# expect BinaryName = "/usr/bin/nvidia-container-runtime"
+```
+
+### 8c: GPU cluster + device plugin
+
+[`k3d/cluster-gpu.yaml`](k3d/cluster-gpu.yaml) is `cluster.yaml` plus the custom
+`image:` and `options.runtime.gpuRequest: all`. The device plugin DaemonSet is what
+makes `nvidia.com/gpu` a schedulable resource; without it the nodes report no GPU
+capacity no matter how well the layers below are wired.
+
+```bash
+k3d cluster delete kserve-lab
+k3d cluster create --config k3d/cluster-gpu.yaml --wait
+kubectl apply -f gpu/runtimeclass.yaml -f gpu/device-plugin.yaml
+make up          # `cluster` target is a no-op when the cluster already exists
+```
+
+**Verify:**
+```bash
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}: {.status.capacity.nvidia\.com/gpu}{"\n"}{end}'
+# expect 1 per node
+```
+
+> Both node containers receive the same single physical GPU, so a one-card host
+> advertises `nvidia.com/gpu: 1` **per node**. Do not schedule two GPU pods at once
+> expecting two independent cards.
+
+### 8d: LLM `InferenceService`
+
+[`manifests/llm/qwen-gpu.yaml`](manifests/llm/qwen-gpu.yaml) serves
+`Qwen2.5-1.5B-Instruct`. No `storageUri`: the runtime downloads from HuggingFace
+itself via `--model_id`, so there is no `storage-initializer` init container.
+`modelFormat: huggingface` matches `kserve-huggingfaceserver`, and KServe selects
+the **`-gpu`** image variant automatically because the pod requests `nvidia.com/gpu`.
+
+**Flag spelling is load-bearing.** The server's own flags are underscored
+(`--model_id`, `--backend`); the vLLM engine flags are registered by vLLM and are
+dashed (`--max-model-len`, `--gpu-memory-utilization`). Parsing uses
+`parse_known_args()`, so a misspelled vLLM flag is **silently dropped**, leaving
+vLLM on its defaults (0.9 utilization, full 32k context) — an OOM on a small card,
+with nothing in the logs pointing at the cause.
+
+```bash
+kubectl apply -f manifests/llm/qwen-gpu.yaml
+kubectl wait --for=condition=Ready --timeout=900s isvc/qwen-llm
+```
+
+First start takes ~10 minutes: a >10 GB image pull, ~3 GB of weights, then vLLM
+engine init (profiling run, KV cache allocation, CUDA graph capture).
+
+**Verify:**
+```bash
+kubectl port-forward svc/qwen-llm-predictor 8090:80
+curl -s -X POST http://localhost:8090/openai/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen-llm","messages":[{"role":"user","content":"What is KServe?"}],"max_tokens":120}'
+```
+
+The runtime exposes OpenAI-compatible routes (`/openai/v1/chat/completions`,
+`/openai/v1/models`) alongside the KServe v1/v2 predict endpoints; for generative
+models the OpenAI ones are the useful pair. Confirm the GPU is actually in use
+rather than a silent CPU fallback:
+
+```bash
+kubectl logs -l serving.kserve.io/inferenceservice=qwen-llm | grep -i "KV cache"
+# expect e.g. "GPU KV cache size: 92,784 tokens"
+```
+
+**Rollback:** `kubectl delete -f manifests/llm/qwen-gpu.yaml`. vLLM holds its VRAM
+allocation for the pod's lifetime, so delete the ISVC before expecting any other
+process (a local Ollama, say) to be able to load a model.

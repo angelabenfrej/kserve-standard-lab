@@ -1,0 +1,46 @@
+# LLM InferenceService on GPU, served by the built-in kserve-huggingfaceserver
+# ClusterServingRuntime (modelFormat: huggingface, priority 1).
+#
+# The runtime image ships vLLM and selects it automatically when a GPU is
+# visible; without `nvidia.com/gpu` in limits it would silently fall back to the
+# slower plain-transformers backend on CPU.
+#
+# Sizing for a single 8 GB card (RTX PRO 1000, ~7.7 GB free once Ollama is idle):
+#   Qwen2.5-1.5B-Instruct in fp16 is ~3.1 GB of weights; the remainder of the
+#   0.85 utilization budget (~6.6 GB) goes to vLLM's KV cache. max_model_len is
+#   capped at 4096 so the cache allocation stays well inside that budget.
+#
+# `runtimeClassName: nvidia` selects the containerd runtime handler that k3s
+# registers once the node image carries the NVIDIA container runtime; see
+# gpu/runtimeclass.yaml.
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen-llm
+spec:
+  predictor:
+    runtimeClassName: nvidia
+    model:
+      modelFormat:
+        name: huggingface
+      # NOTE on flag spelling: huggingfaceserver's own flags are underscored
+      # (--model_id, --backend), while the vLLM engine flags below are registered
+      # by vLLM's own AsyncEngineArgs and are dashed. The server parses with
+      # parse_known_args(), so a misspelled vLLM flag is silently DROPPED rather
+      # than rejected -- which would leave vLLM on its defaults (0.9 memory
+      # utilization, full 32k context) and OOM this 8 GB card.
+      args:
+        - --model_id=Qwen/Qwen2.5-1.5B-Instruct
+        - --backend=vllm
+        - --max-model-len=4096
+        - --gpu-memory-utilization=0.85
+        - --dtype=float16
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "6"
+          memory: 16Gi
+          nvidia.com/gpu: "1"
