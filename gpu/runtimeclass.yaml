@@ -1,0 +1,11 @@
+# k3s scans for `nvidia-container-runtime` on PATH at startup and, when it finds
+# it, registers a containerd runtime handler named "nvidia". This RuntimeClass is
+# the Kubernetes-side handle for that handler: a pod sets
+# `spec.runtimeClassName: nvidia` (on an InferenceService,
+# `spec.predictor.runtimeClassName`) to be started under it and receive the
+# GPU devices.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: nvidia
+handler: nvidia

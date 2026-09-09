@@ -1,0 +1,37 @@
+# GPU variant of cluster.yaml. Identical to it except for two additions:
+#
+#   image:                  the CUDA-enabled k3s node image built from gpu/Dockerfile,
+#                           so containerd inside the node has an NVIDIA runtime
+#   options.runtime.gpuRequest: all
+#                           passes the host GPU into the node containers, the k3d
+#                           equivalent of `docker run --gpus all`
+#
+# NOTE: both node containers receive the same single physical GPU, so the device
+# plugin advertises 1 `nvidia.com/gpu` per node (2 cluster-wide) for one 8 GB card.
+# Fine while a single model is scheduled; do not run two GPU pods at once expecting
+# two independent GPUs.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: kserve-lab
+image: k3s-cuda:v1.35.5-k3s1
+servers: 1
+agents: 1
+ports:
+  - port: 80:80
+    nodeFilters:
+      - loadbalancer
+  - port: 443:443
+    nodeFilters:
+      - loadbalancer
+options:
+  k3s:
+    extraArgs:
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:*
+  runtime:
+    gpuRequest: all
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: true
