@@ -25,7 +25,7 @@ manifests/         Kubernetes manifests (MinIO, PostgreSQL, MLflow, ServingRunti
 mlflow/            custom MLflow server image (Dockerfile)
 custom-runtime/    custom KServe ServingRuntime image (Dockerfile + server)
 gpu/               CUDA-enabled k3s node image, RuntimeClass, NVIDIA device plugin
-train/             local training script and environment config
+train/             local training script, environment config, and TrainJob image
 Makefile           up / down / reset targets consolidating all steps
 ```
 
@@ -710,3 +710,121 @@ kubectl logs -l serving.kserve.io/inferenceservice=qwen-llm | grep -i "KV cache"
 **Rollback:** `kubectl delete -f manifests/llm/qwen-gpu.yaml`. vLLM holds its VRAM
 allocation for the pod's lifetime, so delete the ISVC before expecting any other
 process (a local Ollama, say) to be able to load a model.
+
+---
+
+## Step 9: Kubeflow Trainer and Pipelines
+
+Step 5 trains on the laptop and only *serves* in-cluster. This step moves training
+into the cluster too, so the whole loop runs on Kubernetes.
+
+**Not the full Kubeflow Platform.** `kubeflow/manifests` bundles Istio and its own
+KServe configured for Knative/Serverless mode, which would undo Step 2c and fight
+the Traefik-disabled port reservation from Step 1. Only the two standalone
+components that matter here are installed; neither needs Istio.
+
+### 9a: Kubeflow Trainer
+
+Trainer v2 supersedes the old training-operator (`PyTorchJob`/`TFJob`). It builds
+on JobSet, which its `manager` overlay bundles, so no separate install is needed;
+its webhooks use the cert-manager from Step 2a. `--server-side` is required
+because the CRDs exceed the annotation size limit for client-side apply.
+
+```bash
+kubectl apply --server-side -k "https://github.com/kubeflow/trainer.git/manifests/overlays/manager?ref=v2.3.0"
+kubectl apply --server-side -k "https://github.com/kubeflow/trainer.git/manifests/overlays/runtimes?ref=v2.3.0"
+```
+
+**Verify:**
+```bash
+kubectl get deploy -n kubeflow-system      # jobset + kubeflow-trainer controllers
+kubectl get clustertrainingruntimes        # expect 8
+```
+
+Expect `torch-distributed`, `jax-distributed`, `deepspeed-distributed`,
+`mlx-distributed`, `xgboost-distributed`, and three `torchtune-*` runtimes — one of
+which is `torchtune-qwen2.5-1.5b`, the same model Step 8 serves.
+
+**Rollback:** `kubectl delete -k ".../overlays/runtimes?ref=v2.3.0"`, then the
+`manager` overlay.
+
+### 9b: Kubeflow Pipelines
+
+Standalone KFP, no multi-user/auth stack. It brings its own Argo Workflows, MySQL
+and SeaweedFS (2.17.x replaced its MinIO dependency), all namespaced to `kubeflow`
+and independent of the MinIO/PostgreSQL from Steps 3-4.
+
+```bash
+kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/cluster-scoped-resources?ref=2.17.2"
+kubectl wait --for condition=established --timeout=120s crd/applications.app.k8s.io
+kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/env/platform-agnostic?ref=2.17.2"
+```
+
+**Verify:**
+```bash
+kubectl get deploy -n kubeflow                       # expect 14, all Available
+kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888
+curl -s http://localhost:8888/apis/v1beta1/healthz   # {"tag_name":"2.17.2",...}
+```
+
+The UI is `svc/ml-pipeline-ui` on port 80.
+
+**Rollback:** delete the `platform-agnostic` kustomization, then
+`cluster-scoped-resources`.
+
+### 9c: first `TrainJob`
+
+[`manifests/kubeflow/trainjob-iris.yaml`](manifests/kubeflow/trainjob-iris.yaml)
+runs the Step 5 script as a pod. A `TrainJob` carries no pod spec of its own: it
+references a `ClusterTrainingRuntime` that owns the topology and pod template, and
+overrides only image, command, env and resources — the same split as
+`InferenceService`/`ServingRuntime`. `torch-distributed` serves as a generic
+single-node executor here (`numNodes: 1`, no command of its own).
+
+[`train/Dockerfile`](train/Dockerfile) bakes in `train.py` **unmodified**: its
+`load_dotenv()` is a no-op without a `.env`, so the one script reads a local `.env`
+when run by hand and the TrainJob's `env` block when run as a pod.
+
+```bash
+docker build -t iris-trainer:v1 train/
+k3d image import iris-trainer:v1 -c kserve-lab
+kubectl apply -f manifests/kubeflow/trainjob-iris.yaml
+```
+
+Two things that will bite otherwise:
+
+- **Tag the image something other than `:latest`.** `TrainJob.spec.trainer` exposes
+  no `imagePullPolicy` field, and Kubernetes defaults `:latest` to `Always`, which
+  cannot succeed for an image side-loaded into k3d with no registry behind it. Any
+  other tag defaults to `IfNotPresent`.
+- **MLflow 3 blocks unknown `Host` headers** (DNS-rebinding protection), so an
+  in-cluster caller arriving as `mlflow.kserve-lab.svc.cluster.local` gets
+  `403 Invalid Host header`. `MLFLOW_SERVER_ALLOWED_HOSTS` in
+  [`manifests/mlflow/deployment.yaml`](manifests/mlflow/deployment.yaml) fixes it,
+  but setting it **replaces** the defaults — which included the RFC 1918 ranges the
+  kubelet's liveness probe relies on. Drop `10.*` from that list and every probe
+  gets a 403, the container is killed, and the Deployment CrashLoops while logging
+  nothing but clean shutdowns.
+
+**Verify:**
+```bash
+kubectl get trainjob iris-train
+kubectl get jobset,job,pods -l jobset.sigs.k8s.io/jobset-name=iris-train
+kubectl logs -l jobset.sigs.k8s.io/jobset-name=iris-train --tail=5
+# run_id: ..., accuracy: 1.0, model artifact_path (storageUri): s3://mlflow/...
+```
+
+Confirm the artifacts actually reached MinIO, which is the half that fails silently:
+```bash
+kubectl run mc-check --rm -i --restart=Never -n kserve-lab \
+  --image=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z --command -- sh -c \
+  "mc alias set lab http://minio.kserve-lab.svc.cluster.local:9000 minioadmin minioadmin123 >/dev/null && \
+   mc ls --recursive lab/mlflow/1/models/"
+# expect MLmodel, model.pkl, conda.yaml, python_env.yaml, requirements.txt
+```
+
+The printed `storageUri` is directly usable by an `InferenceService`, the same way
+Step 5 feeds [`manifests/smoke-test/sklearn-iris-mlflow.yaml`](manifests/smoke-test/sklearn-iris-mlflow.yaml).
+
+**Rollback:** `kubectl delete -f manifests/kubeflow/trainjob-iris.yaml`. A `TrainJob`
+is not restartable in place — delete and re-apply to re-run it.
