@@ -26,6 +26,7 @@ mlflow/            custom MLflow server image (Dockerfile)
 custom-runtime/    custom KServe ServingRuntime image (Dockerfile + server)
 gpu/               CUDA-enabled k3s node image, RuntimeClass, NVIDIA device plugin
 train/             local training script, environment config, and TrainJob image
+pipeline/          KFP pipeline definition, compiled spec, and deploy/test steps
 Makefile           up / down / reset targets consolidating all steps
 ```
 
@@ -828,3 +829,129 @@ Step 5 feeds [`manifests/smoke-test/sklearn-iris-mlflow.yaml`](manifests/smoke-t
 
 **Rollback:** `kubectl delete -f manifests/kubeflow/trainjob-iris.yaml`. A `TrainJob`
 is not restartable in place — delete and re-apply to re-run it.
+
+---
+
+## Step 10: Pipeline: train → deploy → smoke-test
+
+Step 9 runs training in-cluster but still leaves deployment manual: read the
+`storageUri` off the logs, write it into an `InferenceService`, apply, curl. This
+step chains those into one graph, where the `storageUri` is a value produced at
+runtime and consumed by the next step.
+
+[`pipeline/iris_pipeline.py`](pipeline/iris_pipeline.py) defines it; the Python is
+a *build script*, not the thing that runs. Compiling emits an IR YAML that the KFP
+backend turns into an Argo `Workflow`.
+
+```
+[1] train-iris       →  [2] deploy-isvc        →  [3] smoke-test
+    iris-trainer:v1        iris-pipeline-ops:v1     iris-pipeline-ops:v1
+    emits storageUri       creates the ISVC         asserts predictions
+```
+
+Each step is a **container component**: an image plus a command. Values pass
+between steps as files — KFP allocates a path, the producer writes to it, the
+consumer receives the contents as an argument.
+
+### 10a: what the pipeline reuses, and why it parses stdout
+
+The training step runs [`train/train.py`](train/train.py) **unmodified**, the same
+script Step 5 runs by hand. Rather than teaching it to emit a machine-readable
+output, the pipeline lifts the line it already prints:
+
+```
+model artifact_path (storageUri): s3://...
+```
+
+A `sh` wrapper in the component extracts that line into KFP's output file. The
+script stays the single canonical trainer for both contexts; the pipeline adapts
+to it, not the other way round.
+
+Steps 2 and 3 share [`pipeline/Dockerfile`](pipeline/Dockerfile) — the Kubernetes
+client plus [`deploy_isvc.py`](pipeline/deploy_isvc.py) and
+[`smoke_test.py`](pipeline/smoke_test.py). The deploy step creates-or-patches, so
+re-running the pipeline updates the model in place instead of failing on conflict.
+
+### 10b: prerequisites
+
+[`manifests/kubeflow/pipeline-prereqs.yaml`](manifests/kubeflow/pipeline-prereqs.yaml)
+covers two things that are easy to miss, both consequences of the pipeline running
+in `kubeflow` while the model is served from `default`:
+
+- **RBAC.** Workflow pods run as the `pipeline-runner` ServiceAccount in
+  `kubeflow`. A ServiceAccount has no rights outside its own namespace, so the
+  deploy step needs an explicit Role/RoleBinding for `inferenceservices` in
+  `default`.
+- **A second copy of the MinIO credentials.** A pod can only reference Secrets in
+  its *own* namespace, so the `s3-credentials` Secret from Step 3 is invisible to
+  the training pod. The same throwaway values are duplicated into `kubeflow`.
+
+```bash
+kubectl apply -f manifests/kubeflow/pipeline-prereqs.yaml
+docker build -t iris-pipeline-ops:v1 pipeline/
+k3d image import iris-pipeline-ops:v1 -c kserve-lab
+```
+
+### 10c: compile and run
+
+The SDK is only needed on the laptop, to compile — keep it out of the system
+Python:
+
+```bash
+python3 -m venv .venv && ./.venv/bin/pip install kfp kfp-kubernetes
+./.venv/bin/python pipeline/iris_pipeline.py     # -> pipeline/iris_pipeline.yaml
+```
+
+Env vars are set per-task with `set_env_variable`; the credentials Secret is wired
+with `kfp.kubernetes.use_secret_as_env`, which lands in a `platforms.kubernetes`
+section of the compiled YAML rather than inline in the container spec. Caching is
+disabled on every step: training should produce a new MLflow run each time, not
+replay a cached result.
+
+Upload and run against the API (no ingress, so port-forward):
+
+```bash
+kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888
+./.venv/bin/python - <<'PY'
+import kfp, time
+c = kfp.Client(host="http://localhost:8888")
+e = c.create_experiment(name="iris")
+r = c.run_pipeline(experiment_id=e.experiment_id,
+                   job_name=f"iris-{int(time.time())}",
+                   pipeline_package_path="pipeline/iris_pipeline.yaml")
+print(c.wait_for_run_completion(r.run_id, timeout=1800).state)
+PY
+```
+
+**Verify:** each step's own output lives in the `-impl-` pods; the `-driver-` pods
+are KFP resolving inputs, and the launcher chatter drowns the interesting lines:
+
+```bash
+for p in $(kubectl get pods -n kubeflow --no-headers | grep "impl" | awk '{print $1}'); do
+  kubectl logs -n kubeflow $p -c main | grep -E "accuracy|storageUri|Ready|smoke test"
+done
+```
+
+Expect the same `s3://` URI in both the train and deploy steps — that is the value
+travelling through the DAG:
+
+```
+accuracy: 1.0
+extracted storageUri: s3://mlflow/1/models/m-.../artifacts
+deploying storageUri: s3://mlflow/1/models/m-.../artifacts
+created InferenceService/iris-pipeline
+InferenceService/iris-pipeline is Ready
+smoke test passed: predictions=[1, 1]
+```
+
+The smoke test matters because `Ready` only means the pods passed their probes; it
+says nothing about whether the model loaded or the prediction path works. Note the
+response carries `"served_by": "custom-sklearn-runtime-lab"` — the namespaced
+`ServingRuntime` from Step 6 outranks the built-in `sklearn` runtimes, as described
+there.
+
+**Rollback:**
+```bash
+kubectl delete isvc iris-pipeline
+kubectl delete -f manifests/kubeflow/pipeline-prereqs.yaml
+```
