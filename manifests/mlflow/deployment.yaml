@@ -17,6 +17,23 @@ spec:
         - name: mlflow
           image: mlflow-lab:latest
           imagePullPolicy: Never
+          env:
+            # MLflow 3 rejects requests whose Host header is not allowlisted
+            # (DNS-rebinding protection), answering 403 "Invalid Host header".
+            # Its default allowlist covers localhost and private IPs only, so an
+            # in-cluster caller arriving as mlflow.kserve-lab.svc.cluster.local
+            # is refused. Setting this variable REPLACES the defaults, hence the
+            # localhost entries: Step 5 reaches MLflow over a port-forward and
+            # would otherwise break. Patterns are fnmatch and are matched against
+            # host:port, so each name needs its `:*` form too.
+            #
+            # `10.*` is not optional. The defaults being replaced included the
+            # RFC 1918 ranges, and the kubelet's liveness probe addresses the pod
+            # by IP (k3s pod CIDR 10.42.0.0/16, services 10.43.0.0/16). Omit it
+            # and every probe gets a 403, the container is killed, and the
+            # Deployment CrashLoops with nothing in the logs but clean shutdowns.
+            - name: MLFLOW_SERVER_ALLOWED_HOSTS
+              value: "mlflow.kserve-lab.svc.cluster.local,mlflow.kserve-lab.svc.cluster.local:*,mlflow,mlflow:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*,10.*,10.*:*"
           args:
             - "--backend-store-uri"
             - "postgresql://mlflow:mlflow123@postgres.kserve-lab.svc.cluster.local:5432/mlflow"

@@ -1,0 +1,56 @@
+# First TrainJob: runs the Step 5 training script in-cluster instead of on the
+# laptop, closing the loop that the local walkthrough leaves open.
+#
+# The TrainJob itself carries no pod spec. It references a ClusterTrainingRuntime
+# (which owns the JobSet topology, the ML policy and the pod template) and
+# overrides only what is job-specific -- image, command, env, resources. This is
+# the same division of labour as KServe's InferenceService/ServingRuntime pair:
+# the runtime is reusable infrastructure, the job is the one-off.
+#
+# `torch-distributed` is used as a generic single-node executor (its mlPolicy is
+# numNodes: 1 and it sets no command of its own), so overriding image and command
+# runs plain scikit-learn under it. A dedicated sklearn runtime would be tidier;
+# this keeps the step to one file.
+#
+# Runs on CPU deliberately: qwen-llm holds ~7 GB of the 8 GB card, and iris
+# trains in under a second regardless.
+apiVersion: trainer.kubeflow.org/v1alpha1
+kind: TrainJob
+metadata:
+  name: iris-train
+  namespace: default
+spec:
+  runtimeRef:
+    name: torch-distributed
+  trainer:
+    # Side-loaded via `k3d image import`; the non-`latest` tag is what makes
+    # Kubernetes default to IfNotPresent. See train/Dockerfile.
+    image: iris-trainer:v1
+    command: ["python", "/app/train.py"]
+    numNodes: 1
+    env:
+      # In-cluster service DNS: the local walkthrough reaches these over
+      # port-forwards, a pod reaches them directly.
+      - name: MLFLOW_TRACKING_URI
+        value: http://mlflow.kserve-lab.svc.cluster.local:5000
+      - name: MLFLOW_S3_ENDPOINT_URL
+        value: http://minio.kserve-lab.svc.cluster.local:9000
+      # Reuses the secret Step 3 already created for KServe's storage-initializer,
+      # so the training job and the serving path authenticate to MinIO identically.
+      - name: AWS_ACCESS_KEY_ID
+        valueFrom:
+          secretKeyRef:
+            name: s3-credentials
+            key: AWS_ACCESS_KEY_ID
+      - name: AWS_SECRET_ACCESS_KEY
+        valueFrom:
+          secretKeyRef:
+            name: s3-credentials
+            key: AWS_SECRET_ACCESS_KEY
+    resourcesPerNode:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
