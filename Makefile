@@ -20,7 +20,7 @@ VENV := .venv
 
 up: cluster cert-manager kserve-crd kserve-controller kserve-runtimes \
 	minio postgres mlflow custom-runtime
-	@echo "Lab is up. See README.md for training + smoke-test steps."
+	@echo "Lab is up. See docs/walkthrough.md for training + smoke-test steps."
 
 down:
 	k3d cluster delete $(CLUSTER_NAME)
