@@ -580,6 +580,35 @@ part of `up`; they're interactive exercises (local venv, foreground port-forward
 not infrastructure. `up` gets the lab ready to use; training/serving a model is a
 manual walkthrough, documented above.
 
+### Targets for Steps 8-10
+
+The later steps have their own targets, each opt-in and none chained into `up`:
+
+| Target | Step | Does |
+| --- | --- | --- |
+| `gpu-up` | 8 | build the CUDA node image, create the GPU cluster, install the device plugin, then `up` |
+| `llm` / `llm-down` | 8 | serve Qwen on vLLM and wait for Ready / delete it and free the VRAM |
+| `kubeflow` | 9 | Trainer (+ its runtimes) and Pipelines, waiting for each to be Available |
+| `trainjob` | 9 | build the training image and run the iris `TrainJob` to completion |
+| `pipeline-run` | 10 | compile if changed, build images, apply prerequisites, run the pipeline |
+
+```bash
+make gpu-up              # instead of `make up`, for the GPU variant of the lab
+make kubeflow
+make trainjob
+make pipeline-run        # KFP_PORT=8899 if 8888 is taken locally
+```
+
+`gpu-up` still needs the host NVIDIA Container Toolkit from Step 8a, which needs
+root and is not automated. It also **refuses to run against an existing CPU
+cluster**: a plain existence check would pass, and the lab would come up without a
+GPU and without an error. `make down` first.
+
+`trainjob` and `pipeline-run` exit non-zero if the job or run fails, so they can be
+chained or scripted. `pipeline-run` holds the KFP port-forward open only for the
+length of the run; the SDK lives in a `.venv` it creates on first use, pinned to the
+version the committed `pipeline/iris_pipeline.yaml` was compiled with.
+
 ---
 
 ## Step 8: GPU passthrough and LLM serving
