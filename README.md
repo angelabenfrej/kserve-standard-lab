@@ -1,830 +1,182 @@
-# KServe Local Lab
+# mlops-platform-k8s
 
-A local, from-scratch KServe setup running in **Standard** mode (no Knative/Istio),
-with MinIO as artifact store, PostgreSQL as metadata store, and MLflow tracking wired
-to both. End-to-end goal: train a scikit-learn model locally, log it to MLflow, serve
-it from an `InferenceService` reading a `s3://` model URI, and call it with `curl`.
+An end-to-end MLOps platform on a single machine: Kubernetes (k3d) running model
+training, experiment tracking, model storage, and serving — including an LLM on the
+local GPU — with a Kubeflow pipeline that trains a model, deploys it, and verifies it
+answers.
 
-Stack: k3d · KServe (Standard/RawDeployment mode) · MinIO · PostgreSQL · MLflow.
+Everything runs locally, is brought up with `make`, and is verified at each layer.
 
-![Cluster architecture](images/kserve_lab_k3d_architecture.png)
-
-## Prerequisites
-
-- Docker
-- `kubectl` v1.36+
-- `helm` v4+
-- `k3d` v5.9+
-- Python 3 (for the local training step)
-
-## Repository layout
-
+```mermaid
+flowchart LR
+  subgraph k3d["k3d cluster — CUDA-enabled k3s nodes"]
+    subgraph train["Training"]
+      KFP["Kubeflow Pipelines<br/>train → deploy → test"]
+      TJ["Kubeflow Trainer<br/>TrainJob"]
+    end
+    subgraph track["Tracking and storage"]
+      MLF["MLflow"]
+      PG[("PostgreSQL")]
+      S3[("MinIO — s3://")]
+    end
+    subgraph serve["Serving — KServe, Standard mode"]
+      SK["sklearn InferenceService"]
+      LLM["Qwen2.5-1.5B on vLLM<br/>(GPU)"]
+    end
+  end
+  KFP -->|train step| MLF
+  TJ -->|log run + model| MLF
+  MLF -->|metadata| PG
+  MLF -->|artifacts| S3
+  S3 -->|storageUri| SK
+  KFP -->|deploy + smoke test| SK
+  C["client"] -->|HTTP| SK
+  C -->|OpenAI-compatible API| LLM
 ```
-k3d/               k3d cluster configs (CPU: cluster.yaml, GPU: cluster-gpu.yaml)
-manifests/         Kubernetes manifests (MinIO, PostgreSQL, MLflow, ServingRuntimes, InferenceServices)
-mlflow/            custom MLflow server image (Dockerfile)
-custom-runtime/    custom KServe ServingRuntime image (Dockerfile + server)
-gpu/               CUDA-enabled k3s node image, RuntimeClass, NVIDIA device plugin
-train/             local training script, environment config, and TrainJob image
-Makefile           up / down / reset targets consolidating all steps
-```
 
----
+## What it demonstrates
 
-## Step 1: Cluster: k3d, 1 server + 1 agent, Traefik disabled
+- **Model serving on Kubernetes.** KServe in Standard mode: each `InferenceService`
+  becomes a plain Deployment, Service and HPA, with no Knative or service mesh. Models
+  are pulled from S3-compatible storage by KServe's storage-initializer; a custom
+  `ServingRuntime` shows how runtime selection and priority work.
+- **GPU infrastructure.** NVIDIA GPU passthrough into containerised Kubernetes nodes,
+  through four layers: host toolkit, a custom CUDA-enabled k3s node image, a
+  `RuntimeClass`, and the NVIDIA device plugin.
+- **LLM serving.** Qwen2.5-1.5B-Instruct on vLLM, sized to fit an 8 GB laptop GPU,
+  exposed through an OpenAI-compatible API.
+- **Experiment tracking.** MLflow with PostgreSQL as its metadata store and MinIO as
+  its artifact store.
+- **Training and orchestration.** Training runs in-cluster as a Kubeflow `TrainJob`,
+  and a Kubeflow Pipelines DAG trains a model, deploys it as an `InferenceService`,
+  and smoke-tests the live endpoint — passing the model URI between steps at runtime.
+- **Reproducibility.** One `make` target per stage, pinned versions throughout, and a
+  verify-and-rollback procedure for every step.
 
-k3d was chosen over kind/minikube: it's multi-node by default and ships
-`local-path-provisioner`, `metrics-server`, and `coredns` out of the box (kind starts
-from a blank slate; minikube is oriented around single-node workflows and adds its own
-driver abstraction on top of Docker).
+## Results
 
-Cluster is defined declaratively in [`k3d/cluster.yaml`](k3d/cluster.yaml):
-- 1 server + 1 agent node
-- ports 80/443 mapped to the k3d load balancer, reserved for a Gateway API `Gateway`
-  later (Traefik is disabled at boot to avoid fighting over those ports)
-- default kubeconfig merge/context switch on create
+| | |
+| --- | --- |
+| LLM on the laptop GPU | Qwen2.5-1.5B-Instruct, fp16, on an 8 GB RTX PRO 1000; 2.48 GiB KV cache (92,784 tokens) |
+| First LLM start | ~9.5 min: >10 GB image, ~3 GB of weights, vLLM engine init |
+| Pipeline run | train → deploy → smoke test in 2 min 16 s |
+
+The trained model is deliberately trivial (Iris, logistic regression). The subject is
+the platform around it.
+
+## Stack
+
+| Layer | Tool | Version |
+| --- | --- | --- |
+| Cluster | k3d / k3s | 5.9.0 / v1.35.5 |
+| Certificates | cert-manager | v1.21.0 |
+| Model serving | KServe, Standard mode | v0.19.0 |
+| LLM runtime | vLLM, via KServe's huggingfaceserver | v0.19.0 image |
+| Experiment tracking | MLflow | 3.16.0 |
+| Metadata store | PostgreSQL | 16 |
+| Object store | MinIO | RELEASE.2025-09-07 |
+| Training | Kubeflow Trainer, with JobSet | v2.3.0 |
+| Orchestration | Kubeflow Pipelines | 2.17.2 |
+| GPU | NVIDIA Container Toolkit / CUDA base image | 1.20.0 / 13.0.1 |
+
+## Quickstart
+
+**Prerequisites:** Docker, `kubectl` 1.36+, `helm` 4+, `k3d` 5.9+, Python 3. For the
+GPU path, an NVIDIA GPU with its driver and the
+[NVIDIA Container Toolkit](docs/walkthrough.md#8a-host-nvidia-container-toolkit)
+installed on the host.
 
 ```bash
-k3d cluster create --config k3d/cluster.yaml --wait
+make up              # CPU platform: cluster, KServe, MinIO, PostgreSQL, MLflow
+# or
+make gpu-up          # the same, on GPU-enabled nodes
+make llm             # serve Qwen on vLLM (GPU path only)
+
+make kubeflow        # Kubeflow Trainer + Pipelines
+make trainjob        # train in-cluster; prints the run and its model URI
+make pipeline-run    # train → deploy → smoke test, as a KFP pipeline
 ```
 
-If the kubeconfig doesn't merge automatically:
-```bash
-k3d kubeconfig merge kserve-lab --kubeconfig-merge-default --kubeconfig-switch-context
-```
-
-**Verify:**
-```bash
-kubectl get nodes -o wide                 # 2 nodes Ready: 1 control-plane, 1 worker
-kubectl get pods -A                       # coredns, local-path-provisioner, metrics-server running; no traefik
-kubectl get storageclass                  # local-path marked (default)
-```
-
-**Rollback:** `k3d cluster delete kserve-lab`
-
----
-
-## Step 2: KServe, Standard mode
-
-### 2a: cert-manager
-
-KServe's admission webhooks require TLS certificates. cert-manager provisions and
-rotates them via `Certificate`/`Issuer` CRDs it watches, writing the result into a
-`Secret` mounted by the webhook `Service`. Its `cainjector` component watches for the
-`cert-manager.io/inject-ca-from` annotation and auto-populates `caBundle` on KServe's
-webhook configurations. This is why cert-manager must be installed and ready *before*
-KServe.
+Call the model the pipeline deployed:
 
 ```bash
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.0/cert-manager.yaml
-kubectl wait --for=condition=Available --timeout=120s deployment --all -n cert-manager
-```
-
-**Rollback:** `kubectl delete -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.0/cert-manager.yaml`
-
-### 2b: KServe CRDs
-
-As of KServe v0.19.0 the Helm charts are split (`kserve-crd`, `kserve-resources`, plus
-LLM/local-model variants); there is no chart literally named `kserve` on GHCR.
-
-```bash
-helm install kserve-crd oci://ghcr.io/kserve/charts/kserve-crd --version v0.19.0 -n kserve --create-namespace
-```
-
-**Verify:**
-```bash
-kubectl get crds | grep kserve
-```
-Expect 6 CRDs: `inferenceservices`, `servingruntimes`, `clusterservingruntimes`,
-`trainedmodels`, `inferencegraphs`, `clusterstoragecontainers` (the last maps URI
-schemes such as `s3://` to a storage-initializer image/credential pattern, used in a
-later step).
-
-**Rollback:** `helm uninstall kserve-crd -n kserve`, safe only while no
-`InferenceService` instances exist; deleting the CRDs afterward cascades and removes
-any live instances.
-
-### 2c: KServe controller in Standard mode
-
-KServe supports two deployment modes: `Knative` (formerly `Serverless`, requires
-Knative + Istio) and `Standard` (formerly `RawDeployment`), the latter reconciles an
-`InferenceService` directly into a `Deployment` + `Service` + `HPA`, with no Knative
-involved. `Standard` is KServe's own code-level default, but the Helm chart's
-`values.yaml` explicitly overrides it to `Knative`, so it has to be set explicitly.
-Note the chart nests all values under a top-level `kserve:` key:
-`kserve.controller.deploymentMode`, not `controller.deploymentMode`.
-
-```bash
-helm install kserve oci://ghcr.io/kserve/charts/kserve-resources --version v0.19.0 -n kserve \
-  --set kserve.controller.deploymentMode=Standard --wait
-```
-
-**Verify:**
-```bash
-kubectl get pods -n kserve
-kubectl get configmap inferenceservice-config -n kserve -o jsonpath='{.data.deploy}'
-# expect: {"defaultDeploymentMode": "Standard"}
-kubectl get mutatingwebhookconfigurations,validatingwebhookconfigurations | grep kserve
-```
-
-**Rollback:** `helm uninstall kserve -n kserve`, leaves CRDs intact; existing
-`InferenceService` objects become unreconciled until reinstalled.
-
-### 2d: built-in ServingRuntimes
-
-`ClusterServingRuntime` objects (cluster-scoped, matching an ISVC's `modelFormat` to
-a runtime container image) ship in a separate chart, and are gated behind another
-disabled-by-default flag, same pattern as 2c.
-
-```bash
-helm install kserve-runtimes oci://ghcr.io/kserve/charts/kserve-runtime-configs --version v0.19.0 -n kserve \
-  --set kserve.servingruntime.enabled=true --wait
-```
-
-**Verify:** `kubectl get clusterservingruntimes`, expect 12 runtimes covering
-`sklearn`, `xgboost`, `lightgbm`, `pytorch`, `tensorflow`, `huggingface`, `paddle`,
-`pmml`, `tensorrt`. Three separate runtimes (`kserve-sklearnserver`, `kserve-mlserver`,
-`kserve-predictiveserver`) all claim `sklearn`; how KServe picks among them when
-multiple runtimes support the same format is covered in the custom `ServingRuntime`
-step below.
-
-**Rollback:** `helm uninstall kserve-runtimes -n kserve`
-
-### 2e: smoke test: public sklearn-iris (`gs://`)
-
-Manifest: [`manifests/smoke-test/sklearn-iris.yaml`](manifests/smoke-test/sklearn-iris.yaml),
-a minimal `InferenceService` pointing `storageUri` at the public
-`gs://kfserving-examples/models/sklearn/1.0/model`, with no deployment-mode annotation
-needed since the cluster-wide default is already `Standard`.
-
-```bash
-kubectl apply -f manifests/smoke-test/sklearn-iris.yaml
-kubectl get isvc sklearn-iris -w
-```
-
-**Reconciliation chain observed:** ISVC created, then KServe's ISVC reconciler matches
-`modelFormat.name: sklearn` against the `ClusterServingRuntime` list, then because the
-deployment mode is `Standard`, it generates the following directly (no Knative in the
-loop):
-- `Deployment/sklearn-iris-predictor`: pod has an init container
-  (`storage-initializer`) that downloads the `gs://` model into a shared `emptyDir`,
-  plus the main `kserve-container` running the matched runtime's server image
-- `Service/sklearn-iris-predictor`: ClusterIP, port 80, selects the predictor pod
-- `HorizontalPodAutoscaler/sklearn-iris-predictor`: targets that Deployment,
-  min 1 / max 1 replicas by default, CPU-utilization metric
-
-**Verify (object graph):**
-```bash
-kubectl get deploy,svc,hpa -l serving.kserve.io/inferenceservice=sklearn-iris
-kubectl get pods -l serving.kserve.io/inferenceservice=sklearn-iris
-```
-
-**Verify (actual inference):** no ingress/Gateway is wired up yet, so reach the
-predictor directly:
-```bash
-kubectl port-forward svc/sklearn-iris-predictor 8080:80
-curl -s -H "Content-Type: application/json" \
-  http://localhost:8080/v1/models/sklearn-iris:predict \
+kubectl port-forward svc/iris-pipeline-predictor 8080:80
+curl -s http://localhost:8080/v1/models/iris-pipeline:predict \
+  -H "Content-Type: application/json" \
   -d '{"instances": [[6.8, 2.8, 4.8, 1.4], [6.0, 3.4, 4.5, 1.6]]}'
 # {"predictions":[1,1]}
 ```
 
-**Rollback:** `kubectl delete -f manifests/smoke-test/sklearn-iris.yaml`, cascades to
-the generated Deployment/Service/HPA (owner references).
+Or the LLM:
 
----
-
-## Step 3: MinIO + S3 credential wiring for `storageUri`
-
-> **On the credentials in this section:** `minio-root-credentials` and
-> `s3-credentials` use plain, throwaway values (`minioadmin`/`minioadmin123`)
-> committed directly in the manifests. This is intentional: these credentials only
-> grant access to a MinIO server running inside an ephemeral local k3d cluster,
-> unreachable from outside the Docker network on the machine it runs on. **Do not
-> reuse this pattern for credentials that grant access to anything real or
-> internet-reachable.**
-
-### 3a: MinIO deployment
-
-Deployed inside the cluster (namespace `kserve-lab`) so this lab's data stays fully
-self-contained. Manifests: [`manifests/minio/`](manifests/minio/): `namespace.yaml`,
-`secret.yaml` (root credentials), `pvc.yaml` (5Gi on `local-path`),
-`deployment.yaml`, `service.yaml`.
-
-Single-replica MinIO with a `ReadWriteOnce` PVC uses `strategy: Recreate` instead of
-the Deployment default `RollingUpdate`. `RollingUpdate` can try to start a new pod
-before killing the old one, and with an RWO volume that leaves the new pod stuck
-waiting for a volume the old pod still holds. `Recreate` kills first, then starts.
-
-```bash
-kubectl apply -f manifests/minio/namespace.yaml
-kubectl apply -f manifests/minio/secret.yaml -f manifests/minio/pvc.yaml \
-  -f manifests/minio/deployment.yaml -f manifests/minio/service.yaml
-```
-
-**Verify:** `kubectl get pods,pvc,svc -n kserve-lab`
-
-**Rollback:** `kubectl delete -f manifests/minio/deployment.yaml -f manifests/minio/service.yaml -f manifests/minio/pvc.yaml -f manifests/minio/secret.yaml`
-(scoped to MinIO's own manifests, not the namespace, since PostgreSQL and MLflow also
-live in `kserve-lab` from Step 4 onward)
-
-### 3b: buckets
-
-```bash
-kubectl apply -f manifests/minio/create-bucket-job.yaml
-kubectl wait --for=condition=complete --timeout=60s job/minio-create-bucket -n kserve-lab
-```
-Creates `models` (direct `storageUri` testing) and `mlflow` (artifact root, used from
-Step 4 onward) in one job.
-
-**Rollback:** `kubectl delete job minio-create-bucket -n kserve-lab` (job only; buckets
-persist until removed separately)
-
-### 3c: S3 credentials for KServe
-
-KServe's controller has a credential-builder that inspects the `ServiceAccount`
-referenced by an ISVC's predictor, finds a `Secret` in that SA's `secrets:` list,
-reads `serving.kserve.io/s3-*` annotations off it, and injects the resulting env vars
-(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT`, etc.) into the
-`storage-initializer` init container.
-
-Manifest: [`manifests/minio/s3-credentials.yaml`](manifests/minio/s3-credentials.yaml):
-`Secret/s3-credentials` + `ServiceAccount/kserve-s3-sa`, both in `default`
-(same namespace as the `InferenceService` that will reference them; the lookup is
-namespace-scoped even though MinIO itself lives in `kserve-lab`, reachable via its
-ClusterIP Service DNS name).
-
-```bash
-kubectl apply -f manifests/minio/s3-credentials.yaml
-```
-
-**Verify:** no visible effect until an ISVC sets
-`spec.predictor.serviceAccountName: kserve-s3-sa`, validated in 3d below.
-
-**Rollback:**
-```bash
-kubectl delete secret s3-credentials -n default
-kubectl delete serviceaccount kserve-s3-sa -n default
-```
-
-### 3d: smoke test: `s3://` wiring
-
-To validate the credential chain independently of the (not yet built) MLflow
-training loop, [`manifests/minio/seed-model-job.yaml`](manifests/minio/seed-model-job.yaml)
-downloads the same public sklearn-iris model artifact used in the Step 2 smoke test
-and uploads it into `s3://models/sklearn-iris/model.joblib`, a throwaway artifact,
-not a real trained model.
-
-```bash
-kubectl apply -f manifests/minio/seed-model-job.yaml
-kubectl wait --for=condition=complete --timeout=60s job/minio-seed-model -n kserve-lab
-
-kubectl apply -f manifests/smoke-test/sklearn-iris-s3.yaml
-kubectl get isvc sklearn-iris-s3 -w
-```
-
-[`manifests/smoke-test/sklearn-iris-s3.yaml`](manifests/smoke-test/sklearn-iris-s3.yaml)
-is identical to the Step 2 ISVC except `storageUri: s3://models/sklearn-iris` and
-`serviceAccountName: kserve-s3-sa`. Reached `READY: True` in ~24s, confirming the
-`storage-initializer` authenticated against MinIO successfully.
-
-```bash
-kubectl port-forward svc/sklearn-iris-s3-predictor 8081:80
-curl -s -H "Content-Type: application/json" \
-  http://localhost:8081/v1/models/sklearn-iris-s3:predict \
-  -d '{"instances": [[6.8, 2.8, 4.8, 1.4], [6.0, 3.4, 4.5, 1.6]]}'
-# {"predictions":[1,1]}
-```
-
-If credentials are wrong, the ISVC sits at `READY: False` and
-`kubectl logs -l serving.kserve.io/inferenceservice=<name> -c storage-initializer`
-shows an S3 auth error.
-
-**Rollback:** `kubectl delete -f manifests/smoke-test/sklearn-iris-s3.yaml`
-
----
-
-## Step 4: PostgreSQL + MLflow
-
-### 4a: PostgreSQL
-
-Same pattern as MinIO: `Secret`/`PVC`/`Deployment`/`Service` in `kserve-lab`,
-`Recreate` strategy for the same `ReadWriteOnce`-volume reason. Manifests:
-[`manifests/postgres/`](manifests/postgres/).
-
-The data volume mount uses `subPath: pgdata` rather than mounting the PVC at
-`/var/lib/postgresql/data` directly: `local-path-provisioner` volumes can contain
-pre-existing entries at the mount root, and Postgres refuses to initialize a data
-directory that isn't completely empty; `subPath` gives it a clean subdirectory.
-
-```bash
-kubectl apply -f manifests/postgres/secret.yaml -f manifests/postgres/pvc.yaml \
-  -f manifests/postgres/deployment.yaml -f manifests/postgres/service.yaml
-```
-
-**Verify:** `kubectl exec -n kserve-lab deploy/postgres -- pg_isready -U mlflow`
-
-**Rollback:** `kubectl delete -f manifests/postgres/`
-
-### 4b: MLflow server image
-
-The official `ghcr.io/mlflow/mlflow` image doesn't include the Postgres driver
-(`psycopg2`) or S3 client (`boto3`) our backend-store/artifact-root combination needs,
-so we build a small custom image: [`mlflow/Dockerfile`](mlflow/Dockerfile). Backend
-store URI and artifact root are intentionally **not** baked into the image, passed as
-container args at deploy time instead, keeping the image itself generic.
-
-```bash
-docker build -t mlflow-lab:latest mlflow/
-k3d image import mlflow-lab:latest -c kserve-lab
-```
-
-`k3d image import` loads the locally-built image directly into each node's containerd
-content store, no container registry involved, which matters since this image only
-ever needs to exist on this one cluster.
-
-**Gotcha:** Kubernetes defaults `imagePullPolicy` to `Always` for any `:latest`-tagged
-image. Without explicitly setting `imagePullPolicy: Never` on the Deployment, the
-kubelet tries to pull `mlflow-lab:latest` from a real registry and fails with
-`ImagePullBackOff`, since the image only exists locally via the import above.
-
-### 4c: MLflow Deployment + Service
-
-Manifests: [`manifests/mlflow/`](manifests/mlflow/). MLflow is run in its default mode
-(`--default-artifact-root`, no `--serve-artifacts` proxying); the tracking server
-only records the artifact URI in Postgres, and actual artifact upload/download happens
-client-side, directly between whatever logs to MLflow and MinIO. This is why the
-MLflow server pod itself needs no S3 credentials, only the Postgres and S3 *locations*
-(both reached via in-cluster Service DNS names).
-
-```bash
-kubectl apply -f manifests/mlflow/deployment.yaml -f manifests/mlflow/service.yaml
-```
-
-**Verify:** don't trust `/` (a static SPA shell); confirm the Postgres wiring through
-the actual tracking API:
-```bash
-kubectl port-forward -n kserve-lab svc/mlflow 5000:5000
-curl -s http://localhost:5000/api/2.0/mlflow/experiments/search -X POST \
-  -H "Content-Type: application/json" -d '{"max_results": 10}'
-```
-Expect the `Default` experiment (`experiment_id: "0"`), which only exists if MLflow
-successfully initialized its schema in Postgres on startup; confirmed
-`artifact_location: "s3://mlflow/0"` too, proving `--default-artifact-root` took
-effect.
-
-**Rollback:** `kubectl delete -f manifests/mlflow/`
-
----
-
-## Step 5: Full loop: train → MLflow → `InferenceService` → `curl`
-
-![Train-to-serve loop](images/kserve_lab_train_to_serve_loop.png)
-
-### 5a: local training environment
-
-Training runs on the host, not in-cluster, so it needs network access to both MLflow
-(tracking API) and MinIO (artifact upload via boto3 inside the MLflow client): two
-separate port-forwards, left running for the duration of training:
-```bash
-kubectl port-forward -n kserve-lab svc/mlflow 5000:5000
-kubectl port-forward -n kserve-lab svc/minio 9010:9000
-```
-
-Local Python env (kept inside the project, not system-wide):
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install mlflow scikit-learn boto3 python-dotenv
-```
-
-Config loaded from [`train/.env`](train/.env) (gitignored) via
-[`train/.env.example`](train/.env.example) as the checked-in template.
-
-### 5b: training script
-
-[`train/train.py`](train/train.py): loads iris, trains a `LogisticRegression`, logs
-params/metrics/model to MLflow, and prints the model's `storageUri`:
-
-```bash
-python train/train.py
-# model artifact_path (storageUri): s3://mlflow/1/models/m-<id>/artifacts
-```
-
-### 5c: the real InferenceService
-
-[`manifests/smoke-test/sklearn-iris-mlflow.yaml`](manifests/smoke-test/sklearn-iris-mlflow.yaml):
-identical shape to the Step 3d ISVC (same `kserve-s3-sa`, same bucket, no new
-credential setup needed), `storageUri` set to the `model_info.artifact_path` value
-above.
-
-```bash
-kubectl apply -f manifests/smoke-test/sklearn-iris-mlflow.yaml
-kubectl get isvc sklearn-iris-mlflow -w
-```
-
-**Verify:**
-```bash
-kubectl port-forward svc/sklearn-iris-mlflow-predictor 8082:80
-curl -s -H "Content-Type: application/json" \
-  http://localhost:8082/v1/models/sklearn-iris-mlflow:predict \
-  -d '{"instances": [[6.8, 2.8, 4.8, 1.4], [6.0, 3.4, 4.5, 1.6]]}'
-# {"predictions":[1,1]}
-```
-
-**Rollback:** `kubectl delete -f manifests/smoke-test/sklearn-iris-mlflow.yaml`
-
----
-
-## Step 6: Custom `ServingRuntime` and `modelFormat` matching
-
-### 6a: how runtime selection actually works
-
-Three built-in `ClusterServingRuntime`s all claim `sklearn`
-(`kserve-sklearnserver`, `kserve-mlserver`, `kserve-predictiveserver`). Traced the
-actual selection algorithm in `ModelSpec.GetSupportingRuntimes`
-(`pkg/apis/serving/v1beta1/predictor_model.go`), rather than assuming:
-
-1. List namespace-scoped `ServingRuntime`s (in the ISVC's namespace) and
-   cluster-scoped `ClusterServingRuntime`s separately:
-   ```bash
-   kubectl get servingruntime -n default
-   kubectl get clusterservingruntime
-   ```
-2. Filter each to runtimes that are not disabled, match MMS/multinode mode, and pass
-   `RuntimeSupportsModel`: a runtime's format is only eligible for *automatic*
-   matching if `autoSelect: true` (or the ISVC names that runtime explicitly via
-   `spec.predictor.model.runtime`):
-   ```bash
-   kubectl get clusterservingruntime -o custom-columns='NAME:.metadata.name,DISABLED:.spec.disabled,MULTIMODEL:.spec.multiModel'
-   kubectl get clusterservingruntime -o custom-columns='NAME:.metadata.name,AUTOSELECT:.spec.supportedModelFormats[?(@.name=="sklearn")].autoSelect'
-   ```
-3. Filter by protocol version support (`IsProtocolVersionSupported`):
-   ```bash
-   kubectl get clusterservingruntime -o custom-columns='NAME:.metadata.name,PROTOCOLS:.spec.protocolVersions'
-   ```
-4. Sort survivors by `priority` for that model format: higher wins; a runtime with
-   no priority always loses to one that declares any:
-   ```bash
-   kubectl get clusterservingruntime -o custom-columns='NAME:.metadata.name,PRIORITY:.spec.supportedModelFormats[?(@.name=="sklearn")].priority'
-   ```
-5. **Namespace-scoped results are always listed ahead of cluster-scoped ones**,
-   regardless of priority value: `srSpecs = append(srSpecs, clusterSrSpecs...)`.
-   Scope beats priority unconditionally. No single `kubectl` query proves an
-   ordering rule enforced in controller code; verified instead by outcome: creating
-   a namespace-scoped `ServingRuntime` for the same format (6b below) and confirming
-   which image the resulting pod actually runs.
-6. First entry in the combined list wins, confirmed via:
-   ```bash
-   kubectl get pod -l serving.kserve.io/inferenceservice=<name> -o jsonpath='{.items[0].spec.containers[0].image}'
-   ```
-
-Verified against the real cluster, of the three runtimes claiming `sklearn`:
-
-| runtime | priority | autoSelect | protocols | result |
-|---|---|---|---|---|
-| `kserve-predictiveserver` | 3 | `false` | v1, v2 | eliminated: not auto-selectable |
-| `kserve-mlserver` | 2 | `true` | v2 only | eliminated: our ISVCs use the v1 `:predict` path |
-| `kserve-sklearnserver` | 1 | `true` | v1, v2 | **only survivor, actually used** |
-
-`kserve-sklearnserver` won despite having the *lowest* priority of the three:
-priority only matters as a tie-breaker among runtimes that already passed the
-`autoSelect` and protocol-version filters, and here it was the only one left.
-
-### 6b: building a real custom `ServingRuntime`
-
-To prove the namespace-scope-wins rule (item 5 in the algorithm above) rather than
-just read about it,
-built a from-scratch runtime, not a copy of KServe's own sklearnserver package, and
-registered it as a namespace-scoped `ServingRuntime` in `default`, intending it to
-override the cluster-scoped `kserve-sklearnserver` for every ISVC in that namespace
-without needing to name it explicitly.
-
-The container contract was reverse-engineered from the real
-`kserve-sklearnserver` `ClusterServingRuntime` object (`kubectl get
-clusterservingruntime kserve-sklearnserver -o yaml`) rather than assumed:
-- container must be named exactly `kserve-container` (the controller merges
-  ISVC-level overrides into a container with this specific name)
-- args follow a templated convention: `--model_name={{.Name}}` (KServe substitutes
-  the ISVC's name at reconcile time), `--model_dir=/mnt/models` (fixed path, where
-  the `storage-initializer` init container drops the downloaded model into a shared
-  `emptyDir` the controller wires up automatically), `--http_port=8080`
-
-[`custom-runtime/server.py`](custom-runtime/server.py): a minimal FastAPI app
-implementing the same contract: loads a `.joblib`/`.pkl`/`.pickle` file from
-`--model_dir`, serves `GET /v1/models/<name>` (readiness) and
-`POST /v1/models/<name>:predict`. Its response includes a `served_by` marker field
-that KServe's own runtimes never return, the only way to prove *this* code, not the
-built-in image, actually handled a request.
-
-[`manifests/custom-runtime/servingruntime.yaml`](manifests/custom-runtime/servingruntime.yaml):
-namespace-scoped `ServingRuntime` in `default`, `autoSelect: true`,
-`protocolVersions: [v1]`.
-
-```bash
-docker build -t custom-sklearn-runtime:latest custom-runtime/
-k3d image import custom-sklearn-runtime:latest -c kserve-lab
-kubectl apply -f manifests/custom-runtime/servingruntime.yaml
-```
-
-**Verify runtime registration:** `kubectl get servingruntime -n default`
-
-[`manifests/smoke-test/sklearn-iris-custom-runtime.yaml`](manifests/smoke-test/sklearn-iris-custom-runtime.yaml):
-same shape as the Step 5c ISVC, deliberately **not** naming a runtime explicitly, to
-prove the override happens automatically rather than because it was forced:
-
-```bash
-kubectl apply -f manifests/smoke-test/sklearn-iris-custom-runtime.yaml
-kubectl get isvc sklearn-iris-custom-runtime -w
-```
-
-**Verify (object level):**
-```bash
-kubectl get pod -l serving.kserve.io/inferenceservice=sklearn-iris-custom-runtime \
-  -o jsonpath='{.items[0].spec.containers[0].image}'
-# custom-sklearn-runtime:latest, not kserve/sklearnserver:v0.19.0
-```
-
-**Verify (actual inference):**
-```bash
-kubectl port-forward svc/sklearn-iris-custom-runtime-predictor 8083:80
-curl -s -H "Content-Type: application/json" \
-  http://localhost:8083/v1/models/sklearn-iris-custom-runtime:predict \
-  -d '{"instances": [[6.8, 2.8, 4.8, 1.4], [6.0, 3.4, 4.5, 1.6]]}'
-# {"predictions":[1,1],"served_by":"custom-sklearn-runtime-lab"}
-```
-
-**Rollback:**
-```bash
-kubectl delete -f manifests/smoke-test/sklearn-iris-custom-runtime.yaml
-kubectl delete -f manifests/custom-runtime/servingruntime.yaml
-docker rmi custom-sklearn-runtime:latest
-```
-
----
-
-## Step 7: Makefile
-
-[`Makefile`](Makefile) consolidates Steps 1-6 into one target per component
-(`cluster`, `cert-manager`, `kserve-crd`, `kserve-controller`, `kserve-runtimes`,
-`minio`, `postgres`, `mlflow`, `custom-runtime`), chained by `up`:
-
-```bash
-make up      # idempotent, safe to re-run on an existing cluster
-make down    # deletes the k3d cluster (cascades everything inside it)
-make reset   # down + up
-```
-
-Training (Step 5) and the smoke-test `InferenceService`s are intentionally **not**
-part of `up`; they're interactive exercises (local venv, foreground port-forwards),
-not infrastructure. `up` gets the lab ready to use; training/serving a model is a
-manual walkthrough, documented above.
-
----
-
-## Step 8: GPU passthrough and LLM serving
-
-Everything above runs on CPU. Serving an LLM needs the host GPU visible to a pod,
-which under k3d means threading it through four layers, each of which fails
-silently and independently:
-
-```
-host NVIDIA driver
-  -> Docker `nvidia` runtime           (nvidia-container-toolkit, on the host)
-  -> containerd inside the k3s node    (custom node image, gpu/Dockerfile)
-  -> kubelet advertises nvidia.com/gpu (device plugin DaemonSet)
-  -> pod requests it                   (resources.limits + runtimeClassName)
-```
-
-### 8a: host: NVIDIA Container Toolkit
-
-Gives Docker an `nvidia` runtime, so `--gpus` can pass the card into a container.
-The repo is distribution-agnostic: use the `amd64` path, not a codename (there is
-no `resolute` build for Ubuntu 26.04).
-
-```bash
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-K=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-U=https://nvidia.github.io/libnvidia-container/stable/deb/amd64
-echo "deb [signed-by=$K] $U /" | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
-
-**Verify:**
-```bash
-docker info | grep -A2 Runtimes            # expect `nvidia` alongside runc
-docker run --rm --gpus all nvidia/cuda:13.0.1-base-ubuntu24.04 nvidia-smi
-```
-
-### 8b: CUDA-enabled k3s node image
-
-k3d runs each node as a Docker container. Passing `--gpus all` gives the *node
-container* the card, but containerd inside it still cannot hand `/dev/nvidia*` to a
-pod, because the stock `rancher/k3s` image carries no NVIDIA container runtime.
-[`gpu/Dockerfile`](gpu/Dockerfile) fixes that: CUDA base image, plus the toolkit,
-with the k3s filesystem overlaid on top. k3s then detects
-`nvidia-container-runtime` on PATH at boot and registers it with containerd as a
-runtime handler named `nvidia`.
-
-Requires BuildKit (the `COPY --exclude` in the Dockerfile); on Docker 29 that means
-the `buildx` plugin, installable without root into `~/.docker/cli-plugins/`.
-
-```bash
-docker build --load -t k3s-cuda:v1.35.5-k3s1 gpu/
-```
-
-**Verify:**
-```bash
-docker exec k3d-kserve-lab-agent-0 \
-  grep -A3 "runtimes.'nvidia'" /var/lib/rancher/k3s/agent/etc/containerd/config.toml
-# expect BinaryName = "/usr/bin/nvidia-container-runtime"
-```
-
-### 8c: GPU cluster + device plugin
-
-[`k3d/cluster-gpu.yaml`](k3d/cluster-gpu.yaml) is `cluster.yaml` plus the custom
-`image:` and `options.runtime.gpuRequest: all`. The device plugin DaemonSet is what
-makes `nvidia.com/gpu` a schedulable resource; without it the nodes report no GPU
-capacity no matter how well the layers below are wired.
-
-```bash
-k3d cluster delete kserve-lab
-k3d cluster create --config k3d/cluster-gpu.yaml --wait
-kubectl apply -f gpu/runtimeclass.yaml -f gpu/device-plugin.yaml
-make up          # `cluster` target is a no-op when the cluster already exists
-```
-
-**Verify:**
-```bash
-kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}: {.status.capacity.nvidia\.com/gpu}{"\n"}{end}'
-# expect 1 per node
-```
-
-> Both node containers receive the same single physical GPU, so a one-card host
-> advertises `nvidia.com/gpu: 1` **per node**. Do not schedule two GPU pods at once
-> expecting two independent cards.
-
-### 8d: LLM `InferenceService`
-
-[`manifests/llm/qwen-gpu.yaml`](manifests/llm/qwen-gpu.yaml) serves
-`Qwen2.5-1.5B-Instruct`. No `storageUri`: the runtime downloads from HuggingFace
-itself via `--model_id`, so there is no `storage-initializer` init container.
-`modelFormat: huggingface` matches `kserve-huggingfaceserver`, and KServe selects
-the **`-gpu`** image variant automatically because the pod requests `nvidia.com/gpu`.
-
-**Flag spelling is load-bearing.** The server's own flags are underscored
-(`--model_id`, `--backend`); the vLLM engine flags are registered by vLLM and are
-dashed (`--max-model-len`, `--gpu-memory-utilization`). Parsing uses
-`parse_known_args()`, so a misspelled vLLM flag is **silently dropped**, leaving
-vLLM on its defaults (0.9 utilization, full 32k context) — an OOM on a small card,
-with nothing in the logs pointing at the cause.
-
-```bash
-kubectl apply -f manifests/llm/qwen-gpu.yaml
-kubectl wait --for=condition=Ready --timeout=900s isvc/qwen-llm
-```
-
-First start takes ~10 minutes: a >10 GB image pull, ~3 GB of weights, then vLLM
-engine init (profiling run, KV cache allocation, CUDA graph capture).
-
-**Verify:**
 ```bash
 kubectl port-forward svc/qwen-llm-predictor 8090:80
-curl -s -X POST http://localhost:8090/openai/v1/chat/completions \
+curl -s http://localhost:8090/openai/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen-llm","messages":[{"role":"user","content":"What is KServe?"}],"max_tokens":120}'
 ```
 
-The runtime exposes OpenAI-compatible routes (`/openai/v1/chat/completions`,
-`/openai/v1/models`) alongside the KServe v1/v2 predict endpoints; for generative
-models the OpenAI ones are the useful pair. Confirm the GPU is actually in use
-rather than a silent CPU fallback:
+Tear down with `make llm-down` (frees the GPU) or `make down` (deletes the cluster).
 
-```bash
-kubectl logs -l serving.kserve.io/inferenceservice=qwen-llm | grep -i "KV cache"
-# expect e.g. "GPU KV cache size: 92,784 tokens"
+## Design decisions
+
+- **KServe in Standard mode, not Knative.** Every object KServe generates is an
+  ordinary Kubernetes resource, so a serving failure is debugged at one layer instead
+  of four. The trade-off is no scale-to-zero and no built-in traffic splitting.
+- **Standalone Kubeflow components, not the Kubeflow Platform.** The full platform
+  bundles Istio and its own KServe configured for Knative mode, which would override
+  the choice above. Trainer and Pipelines install on their own and need no mesh.
+- **One training script, three contexts.** `train/train.py` runs unchanged on the
+  host, as a `TrainJob`, and as a pipeline step. The pipeline adapts to the script's
+  existing output rather than the script being adapted to the pipeline.
+- **Pinned image tags.** Adopted after the upstream MinIO images disappeared from
+  Docker Hub and broke a `:latest` reference without warning.
+
+## Engineering notes
+
+The problems that took real diagnosis — most of them failed silently or pointed at
+the wrong cause.
+
+| Symptom | Root cause |
+| --- | --- |
+| GPU visible to the node container, but not to pods | The stock k3s image has no NVIDIA container runtime, so containerd cannot hand the device to a pod. Fixed with a CUDA-based k3s node image. |
+| LLM would run out of GPU memory with no hint why | vLLM's flags are dashed while KServe's are underscored, and the server parses with `parse_known_args()`, so a misspelled flag is silently dropped and vLLM falls back to its defaults. |
+| MinIO in `ImagePullBackOff`, with DNS and timeout errors | Not a network fault: the repository had been removed from Docker Hub. Moved to quay.io and pinned. |
+| MLflow rejected in-cluster calls with `403 Invalid Host header` | MLflow 3's DNS-rebinding protection allowlists `Host` headers. |
+| Fixing that made MLflow crash-loop, logging only clean shutdowns | The allowlist variable *replaces* the defaults, including the private IP ranges the kubelet's health probes use. |
+| An sklearn model was served by an unexpected runtime | A namespaced `ServingRuntime` outranks a cluster-wide one at equal priority. |
+
+Each is written up in full, with the diagnosis, in the [walkthrough](docs/walkthrough.md).
+
+## Limitations and next steps
+
+- **No ingress yet.** Models are reached by port-forward; ports 80/443 are reserved
+  for a Gateway API `Gateway`.
+- **One GPU, advertised per node.** k3d nodes share the host, so the single card is
+  reported once per node; run one GPU workload at a time.
+- **Local-only credentials.** MinIO and PostgreSQL use throwaway values committed in
+  plain text, by design for a local environment.
+
+Planned: Gateway API ingress; LoRA fine-tuning of Qwen with Kubeflow Trainer's
+torchtune runtime; an accuracy gate and MLflow model registry in the pipeline;
+monitoring for vLLM and KServe metrics.
+
+## Repository layout
+
+```
+Makefile           one target per stage: up, gpu-up, llm, kubeflow, trainjob, pipeline-run
+k3d/               cluster configs (CPU: cluster.yaml, GPU: cluster-gpu.yaml)
+gpu/               CUDA-enabled k3s node image, RuntimeClass, NVIDIA device plugin
+manifests/         MinIO, PostgreSQL, MLflow, serving runtimes, InferenceServices, Kubeflow jobs
+mlflow/            MLflow server image
+custom-runtime/    custom KServe ServingRuntime image
+train/             training script and its TrainJob image
+pipeline/          KFP pipeline definition, compiled spec, deploy and smoke-test steps
+docs/              step-by-step build walkthrough
 ```
 
-**Rollback:** `kubectl delete -f manifests/llm/qwen-gpu.yaml`. vLLM holds its VRAM
-allocation for the pod's lifetime, so delete the ISVC before expecting any other
-process (a local Ollama, say) to be able to load a model.
+## Documentation
 
----
-
-## Step 9: Kubeflow Trainer and Pipelines
-
-Step 5 trains on the laptop and only *serves* in-cluster. This step moves training
-into the cluster too, so the whole loop runs on Kubernetes.
-
-**Not the full Kubeflow Platform.** `kubeflow/manifests` bundles Istio and its own
-KServe configured for Knative/Serverless mode, which would undo Step 2c and fight
-the Traefik-disabled port reservation from Step 1. Only the two standalone
-components that matter here are installed; neither needs Istio.
-
-### 9a: Kubeflow Trainer
-
-Trainer v2 supersedes the old training-operator (`PyTorchJob`/`TFJob`). It builds
-on JobSet, which its `manager` overlay bundles, so no separate install is needed;
-its webhooks use the cert-manager from Step 2a. `--server-side` is required
-because the CRDs exceed the annotation size limit for client-side apply.
-
-```bash
-kubectl apply --server-side -k "https://github.com/kubeflow/trainer.git/manifests/overlays/manager?ref=v2.3.0"
-kubectl apply --server-side -k "https://github.com/kubeflow/trainer.git/manifests/overlays/runtimes?ref=v2.3.0"
-```
-
-**Verify:**
-```bash
-kubectl get deploy -n kubeflow-system      # jobset + kubeflow-trainer controllers
-kubectl get clustertrainingruntimes        # expect 8
-```
-
-Expect `torch-distributed`, `jax-distributed`, `deepspeed-distributed`,
-`mlx-distributed`, `xgboost-distributed`, and three `torchtune-*` runtimes — one of
-which is `torchtune-qwen2.5-1.5b`, the same model Step 8 serves.
-
-**Rollback:** `kubectl delete -k ".../overlays/runtimes?ref=v2.3.0"`, then the
-`manager` overlay.
-
-### 9b: Kubeflow Pipelines
-
-Standalone KFP, no multi-user/auth stack. It brings its own Argo Workflows, MySQL
-and SeaweedFS (2.17.x replaced its MinIO dependency), all namespaced to `kubeflow`
-and independent of the MinIO/PostgreSQL from Steps 3-4.
-
-```bash
-kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/cluster-scoped-resources?ref=2.17.2"
-kubectl wait --for condition=established --timeout=120s crd/applications.app.k8s.io
-kubectl apply -k "github.com/kubeflow/pipelines/manifests/kustomize/env/platform-agnostic?ref=2.17.2"
-```
-
-**Verify:**
-```bash
-kubectl get deploy -n kubeflow                       # expect 14, all Available
-kubectl port-forward -n kubeflow svc/ml-pipeline 8888:8888
-curl -s http://localhost:8888/apis/v1beta1/healthz   # {"tag_name":"2.17.2",...}
-```
-
-The UI is `svc/ml-pipeline-ui` on port 80.
-
-**Rollback:** delete the `platform-agnostic` kustomization, then
-`cluster-scoped-resources`.
-
-### 9c: first `TrainJob`
-
-[`manifests/kubeflow/trainjob-iris.yaml`](manifests/kubeflow/trainjob-iris.yaml)
-runs the Step 5 script as a pod. A `TrainJob` carries no pod spec of its own: it
-references a `ClusterTrainingRuntime` that owns the topology and pod template, and
-overrides only image, command, env and resources — the same split as
-`InferenceService`/`ServingRuntime`. `torch-distributed` serves as a generic
-single-node executor here (`numNodes: 1`, no command of its own).
-
-[`train/Dockerfile`](train/Dockerfile) bakes in `train.py` **unmodified**: its
-`load_dotenv()` is a no-op without a `.env`, so the one script reads a local `.env`
-when run by hand and the TrainJob's `env` block when run as a pod.
-
-```bash
-docker build -t iris-trainer:v1 train/
-k3d image import iris-trainer:v1 -c kserve-lab
-kubectl apply -f manifests/kubeflow/trainjob-iris.yaml
-```
-
-Two things that will bite otherwise:
-
-- **Tag the image something other than `:latest`.** `TrainJob.spec.trainer` exposes
-  no `imagePullPolicy` field, and Kubernetes defaults `:latest` to `Always`, which
-  cannot succeed for an image side-loaded into k3d with no registry behind it. Any
-  other tag defaults to `IfNotPresent`.
-- **MLflow 3 blocks unknown `Host` headers** (DNS-rebinding protection), so an
-  in-cluster caller arriving as `mlflow.kserve-lab.svc.cluster.local` gets
-  `403 Invalid Host header`. `MLFLOW_SERVER_ALLOWED_HOSTS` in
-  [`manifests/mlflow/deployment.yaml`](manifests/mlflow/deployment.yaml) fixes it,
-  but setting it **replaces** the defaults — which included the RFC 1918 ranges the
-  kubelet's liveness probe relies on. Drop `10.*` from that list and every probe
-  gets a 403, the container is killed, and the Deployment CrashLoops while logging
-  nothing but clean shutdowns.
-
-**Verify:**
-```bash
-kubectl get trainjob iris-train
-kubectl get jobset,job,pods -l jobset.sigs.k8s.io/jobset-name=iris-train
-kubectl logs -l jobset.sigs.k8s.io/jobset-name=iris-train --tail=5
-# run_id: ..., accuracy: 1.0, model artifact_path (storageUri): s3://mlflow/...
-```
-
-Confirm the artifacts actually reached MinIO, which is the half that fails silently:
-```bash
-kubectl run mc-check --rm -i --restart=Never -n kserve-lab \
-  --image=quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z --command -- sh -c \
-  "mc alias set lab http://minio.kserve-lab.svc.cluster.local:9000 minioadmin minioadmin123 >/dev/null && \
-   mc ls --recursive lab/mlflow/1/models/"
-# expect MLmodel, model.pkl, conda.yaml, python_env.yaml, requirements.txt
-```
-
-The printed `storageUri` is directly usable by an `InferenceService`, the same way
-Step 5 feeds [`manifests/smoke-test/sklearn-iris-mlflow.yaml`](manifests/smoke-test/sklearn-iris-mlflow.yaml).
-
-**Rollback:** `kubectl delete -f manifests/kubeflow/trainjob-iris.yaml`. A `TrainJob`
-is not restartable in place — delete and re-apply to re-run it.
+[docs/walkthrough.md](docs/walkthrough.md) is the full build, step by step: the
+reasoning behind each component, the commands, and how to verify and roll back each
+step.

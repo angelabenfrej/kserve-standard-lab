@@ -1,0 +1,121 @@
+# PIPELINE DEFINITION
+# Name: iris-train-deploy
+# Description: Train iris, log to MLflow/MinIO, serve it with KServe, verify it answers.
+components:
+  comp-deploy-isvc:
+    executorLabel: exec-deploy-isvc
+    inputDefinitions:
+      parameters:
+        storage_uri:
+          parameterType: STRING
+  comp-smoke-test:
+    executorLabel: exec-smoke-test
+  comp-train-iris:
+    executorLabel: exec-train-iris
+    outputDefinitions:
+      parameters:
+        storage_uri:
+          parameterType: STRING
+deploymentSpec:
+  executors:
+    exec-deploy-isvc:
+      container:
+        args:
+        - '{{$.inputs.parameters[''storage_uri'']}}'
+        command:
+        - python
+        - /app/deploy_isvc.py
+        image: iris-pipeline-ops:v1
+    exec-smoke-test:
+      container:
+        command:
+        - python
+        - /app/smoke_test.py
+        image: iris-pipeline-ops:v1
+    exec-train-iris:
+      container:
+        args:
+        - '{{$.outputs.parameters[''storage_uri''].output_file}}'
+        command:
+        - sh
+        - -c
+        - '
+
+          set -e
+
+          python /app/train.py > /tmp/train.log 2>&1 || { cat /tmp/train.log; exit
+          1; }
+
+          cat /tmp/train.log
+
+          mkdir -p "$(dirname "$1")"
+
+          sed -n ''s/^model artifact_path (storageUri): //p'' /tmp/train.log | tr
+          -d ''\n'' > "$1"
+
+          test -s "$1" || { echo "no storageUri found in training output"; exit 1;
+          }
+
+          echo "extracted storageUri: $(cat "$1")"
+
+          '
+        - sh
+        env:
+        - name: MLFLOW_TRACKING_URI
+          value: http://mlflow.kserve-lab.svc.cluster.local:5000
+        - name: MLFLOW_S3_ENDPOINT_URL
+          value: http://minio.kserve-lab.svc.cluster.local:9000
+        image: iris-trainer:v1
+pipelineInfo:
+  description: Train iris, log to MLflow/MinIO, serve it with KServe, verify it answers.
+  name: iris-train-deploy
+root:
+  dag:
+    tasks:
+      deploy-isvc:
+        cachingOptions: {}
+        componentRef:
+          name: comp-deploy-isvc
+        dependentTasks:
+        - train-iris
+        inputs:
+          parameters:
+            storage_uri:
+              taskOutputParameter:
+                outputParameterKey: storage_uri
+                producerTask: train-iris
+        taskInfo:
+          name: deploy-isvc
+      smoke-test:
+        cachingOptions: {}
+        componentRef:
+          name: comp-smoke-test
+        dependentTasks:
+        - deploy-isvc
+        taskInfo:
+          name: smoke-test
+      train-iris:
+        cachingOptions: {}
+        componentRef:
+          name: comp-train-iris
+        taskInfo:
+          name: train-iris
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.17.0
+---
+platforms:
+  kubernetes:
+    deploymentSpec:
+      executors:
+        exec-train-iris:
+          secretAsEnv:
+          - keyToEnv:
+            - envVar: AWS_ACCESS_KEY_ID
+              secretKey: AWS_ACCESS_KEY_ID
+            - envVar: AWS_SECRET_ACCESS_KEY
+              secretKey: AWS_SECRET_ACCESS_KEY
+            optional: false
+            secretName: s3-credentials
+            secretNameParameter:
+              runtimeValue:
+                constant: s3-credentials

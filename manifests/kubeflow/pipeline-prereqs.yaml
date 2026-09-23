@@ -1,0 +1,53 @@
+# Prerequisites for the KFP pipeline (Step 10): cross-namespace RBAC, and a copy
+# of the MinIO credentials in the namespace the pipeline actually runs in.
+#
+# A pod can only reference Secrets from its own namespace, and KFP workflow pods
+# run in `kubeflow`, so the `s3-credentials` Secret created in `default` by
+# Step 3 is invisible to them. Hence the duplicate below. Same throwaway values
+# as Step 3 -- see the note there on why these are committed in the clear.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: kubeflow
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin123
+---
+# KFP workflow pods run as the `pipeline-runner` ServiceAccount in the `kubeflow`
+# namespace, but the pipeline's deploy step creates an InferenceService in
+# `default` (where s3-credentials from Step 3 lives). A ServiceAccount carries no
+# rights outside its own namespace, so grant them explicitly here.
+#
+# Deliberately a Role, not a ClusterRole: the pipeline only ever touches
+# `default`, and only KServe's own resources plus the pods/services it needs to
+# read back to confirm the deployment came up.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pipeline-isvc-deployer
+  namespace: default
+rules:
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["inferenceservices"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # The deploy step polls readiness and the smoke test resolves the predictor
+  # Service; both are reads only.
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pipeline-isvc-deployer
+  namespace: default
+subjects:
+  - kind: ServiceAccount
+    name: pipeline-runner
+    namespace: kubeflow
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pipeline-isvc-deployer
