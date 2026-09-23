@@ -1,34 +1,20 @@
-# KServe Local Lab
+# Build walkthrough
 
-A local, from-scratch KServe setup running in **Standard** mode (no Knative/Istio),
-with MinIO as artifact store, PostgreSQL as metadata store, and MLflow tracking wired
-to both. End-to-end goal: train a scikit-learn model locally, log it to MLflow, serve
-it from an `InferenceService` reading a `s3://` model URI, and call it with `curl`.
+The step-by-step build of [mlops-platform-k8s](../README.md), in the order it was
+assembled. Every step gives the reasoning, the commands, how to **verify** it worked,
+and how to **roll it back**.
 
-Stack: k3d · KServe (Standard/RawDeployment mode) · MinIO · PostgreSQL · MLflow.
+| Steps | What they build |
+| --- | --- |
+| 1–7 | the CPU platform: k3d, KServe in Standard mode, MinIO, PostgreSQL, MLflow, a custom `ServingRuntime`, and the Makefile |
+| 8 | GPU passthrough into k3d, and LLM serving on vLLM |
+| 9 | in-cluster training with Kubeflow Trainer, plus Kubeflow Pipelines |
+| 10 | a pipeline chaining train → deploy → smoke-test |
 
-![Cluster architecture](images/kserve_lab_k3d_architecture.png)
+Prerequisites and the quickstart are in the [README](../README.md#quickstart). The
+diagram below covers Steps 1–7; the README has one for the full platform.
 
-## Prerequisites
-
-- Docker
-- `kubectl` v1.36+
-- `helm` v4+
-- `k3d` v5.9+
-- Python 3 (for the local training step)
-
-## Repository layout
-
-```
-k3d/               k3d cluster configs (CPU: cluster.yaml, GPU: cluster-gpu.yaml)
-manifests/         Kubernetes manifests (MinIO, PostgreSQL, MLflow, ServingRuntimes, InferenceServices)
-mlflow/            custom MLflow server image (Dockerfile)
-custom-runtime/    custom KServe ServingRuntime image (Dockerfile + server)
-gpu/               CUDA-enabled k3s node image, RuntimeClass, NVIDIA device plugin
-train/             local training script, environment config, and TrainJob image
-pipeline/          KFP pipeline definition, compiled spec, and deploy/test steps
-Makefile           up / down / reset targets consolidating all steps
-```
+![Cluster architecture, Steps 1-7](../images/kserve_lab_k3d_architecture.png)
 
 ---
 
@@ -39,7 +25,7 @@ k3d was chosen over kind/minikube: it's multi-node by default and ships
 from a blank slate; minikube is oriented around single-node workflows and adds its own
 driver abstraction on top of Docker).
 
-Cluster is defined declaratively in [`k3d/cluster.yaml`](k3d/cluster.yaml):
+Cluster is defined declaratively in [`k3d/cluster.yaml`](../k3d/cluster.yaml):
 - 1 server + 1 agent node
 - ports 80/443 mapped to the k3d load balancer, reserved for a Gateway API `Gateway`
   later (Traefik is disabled at boot to avoid fighting over those ports)
@@ -153,7 +139,7 @@ step below.
 
 ### 2e: smoke test: public sklearn-iris (`gs://`)
 
-Manifest: [`manifests/smoke-test/sklearn-iris.yaml`](manifests/smoke-test/sklearn-iris.yaml),
+Manifest: [`manifests/smoke-test/sklearn-iris.yaml`](../manifests/smoke-test/sklearn-iris.yaml),
 a minimal `InferenceService` pointing `storageUri` at the public
 `gs://kfserving-examples/models/sklearn/1.0/model`, with no deployment-mode annotation
 needed since the cluster-wide default is already `Standard`.
@@ -208,7 +194,7 @@ the generated Deployment/Service/HPA (owner references).
 ### 3a: MinIO deployment
 
 Deployed inside the cluster (namespace `kserve-lab`) so this lab's data stays fully
-self-contained. Manifests: [`manifests/minio/`](manifests/minio/): `namespace.yaml`,
+self-contained. Manifests: [`manifests/minio/`](../manifests/minio/): `namespace.yaml`,
 `secret.yaml` (root credentials), `pvc.yaml` (5Gi on `local-path`),
 `deployment.yaml`, `service.yaml`.
 
@@ -249,7 +235,7 @@ reads `serving.kserve.io/s3-*` annotations off it, and injects the resulting env
 (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_ENDPOINT`, etc.) into the
 `storage-initializer` init container.
 
-Manifest: [`manifests/minio/s3-credentials.yaml`](manifests/minio/s3-credentials.yaml):
+Manifest: [`manifests/minio/s3-credentials.yaml`](../manifests/minio/s3-credentials.yaml):
 `Secret/s3-credentials` + `ServiceAccount/kserve-s3-sa`, both in `default`
 (same namespace as the `InferenceService` that will reference them; the lookup is
 namespace-scoped even though MinIO itself lives in `kserve-lab`, reachable via its
@@ -271,7 +257,7 @@ kubectl delete serviceaccount kserve-s3-sa -n default
 ### 3d: smoke test: `s3://` wiring
 
 To validate the credential chain independently of the (not yet built) MLflow
-training loop, [`manifests/minio/seed-model-job.yaml`](manifests/minio/seed-model-job.yaml)
+training loop, [`manifests/minio/seed-model-job.yaml`](../manifests/minio/seed-model-job.yaml)
 downloads the same public sklearn-iris model artifact used in the Step 2 smoke test
 and uploads it into `s3://models/sklearn-iris/model.joblib`, a throwaway artifact,
 not a real trained model.
@@ -284,7 +270,7 @@ kubectl apply -f manifests/smoke-test/sklearn-iris-s3.yaml
 kubectl get isvc sklearn-iris-s3 -w
 ```
 
-[`manifests/smoke-test/sklearn-iris-s3.yaml`](manifests/smoke-test/sklearn-iris-s3.yaml)
+[`manifests/smoke-test/sklearn-iris-s3.yaml`](../manifests/smoke-test/sklearn-iris-s3.yaml)
 is identical to the Step 2 ISVC except `storageUri: s3://models/sklearn-iris` and
 `serviceAccountName: kserve-s3-sa`. Reached `READY: True` in ~24s, confirming the
 `storage-initializer` authenticated against MinIO successfully.
@@ -311,7 +297,7 @@ shows an S3 auth error.
 
 Same pattern as MinIO: `Secret`/`PVC`/`Deployment`/`Service` in `kserve-lab`,
 `Recreate` strategy for the same `ReadWriteOnce`-volume reason. Manifests:
-[`manifests/postgres/`](manifests/postgres/).
+[`manifests/postgres/`](../manifests/postgres/).
 
 The data volume mount uses `subPath: pgdata` rather than mounting the PVC at
 `/var/lib/postgresql/data` directly: `local-path-provisioner` volumes can contain
@@ -331,7 +317,7 @@ kubectl apply -f manifests/postgres/secret.yaml -f manifests/postgres/pvc.yaml \
 
 The official `ghcr.io/mlflow/mlflow` image doesn't include the Postgres driver
 (`psycopg2`) or S3 client (`boto3`) our backend-store/artifact-root combination needs,
-so we build a small custom image: [`mlflow/Dockerfile`](mlflow/Dockerfile). Backend
+so we build a small custom image: [`mlflow/Dockerfile`](../mlflow/Dockerfile). Backend
 store URI and artifact root are intentionally **not** baked into the image, passed as
 container args at deploy time instead, keeping the image itself generic.
 
@@ -351,7 +337,7 @@ kubelet tries to pull `mlflow-lab:latest` from a real registry and fails with
 
 ### 4c: MLflow Deployment + Service
 
-Manifests: [`manifests/mlflow/`](manifests/mlflow/). MLflow is run in its default mode
+Manifests: [`manifests/mlflow/`](../manifests/mlflow/). MLflow is run in its default mode
 (`--default-artifact-root`, no `--serve-artifacts` proxying); the tracking server
 only records the artifact URI in Postgres, and actual artifact upload/download happens
 client-side, directly between whatever logs to MLflow and MinIO. This is why the
@@ -380,7 +366,7 @@ effect.
 
 ## Step 5: Full loop: train → MLflow → `InferenceService` → `curl`
 
-![Train-to-serve loop](images/kserve_lab_train_to_serve_loop.png)
+![Train-to-serve loop](../images/kserve_lab_train_to_serve_loop.png)
 
 ### 5a: local training environment
 
@@ -398,12 +384,12 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install mlflow scikit-learn boto3 python-dotenv
 ```
 
-Config loaded from [`train/.env`](train/.env) (gitignored) via
-[`train/.env.example`](train/.env.example) as the checked-in template.
+Config loaded from `train/.env` (gitignored, so not in the repo), created by copying
+[`train/.env.example`](../train/.env.example), the checked-in template.
 
 ### 5b: training script
 
-[`train/train.py`](train/train.py): loads iris, trains a `LogisticRegression`, logs
+[`train/train.py`](../train/train.py): loads iris, trains a `LogisticRegression`, logs
 params/metrics/model to MLflow, and prints the model's `storageUri`:
 
 ```bash
@@ -413,7 +399,7 @@ python train/train.py
 
 ### 5c: the real InferenceService
 
-[`manifests/smoke-test/sklearn-iris-mlflow.yaml`](manifests/smoke-test/sklearn-iris-mlflow.yaml):
+[`manifests/smoke-test/sklearn-iris-mlflow.yaml`](../manifests/smoke-test/sklearn-iris-mlflow.yaml):
 identical shape to the Step 3d ISVC (same `kserve-s3-sa`, same bucket, no new
 credential setup needed), `storageUri` set to the `model_info.artifact_path` value
 above.
@@ -510,14 +496,14 @@ clusterservingruntime kserve-sklearnserver -o yaml`) rather than assumed:
   the `storage-initializer` init container drops the downloaded model into a shared
   `emptyDir` the controller wires up automatically), `--http_port=8080`
 
-[`custom-runtime/server.py`](custom-runtime/server.py): a minimal FastAPI app
+[`custom-runtime/server.py`](../custom-runtime/server.py): a minimal FastAPI app
 implementing the same contract: loads a `.joblib`/`.pkl`/`.pickle` file from
 `--model_dir`, serves `GET /v1/models/<name>` (readiness) and
 `POST /v1/models/<name>:predict`. Its response includes a `served_by` marker field
 that KServe's own runtimes never return, the only way to prove *this* code, not the
 built-in image, actually handled a request.
 
-[`manifests/custom-runtime/servingruntime.yaml`](manifests/custom-runtime/servingruntime.yaml):
+[`manifests/custom-runtime/servingruntime.yaml`](../manifests/custom-runtime/servingruntime.yaml):
 namespace-scoped `ServingRuntime` in `default`, `autoSelect: true`,
 `protocolVersions: [v1]`.
 
@@ -529,7 +515,7 @@ kubectl apply -f manifests/custom-runtime/servingruntime.yaml
 
 **Verify runtime registration:** `kubectl get servingruntime -n default`
 
-[`manifests/smoke-test/sklearn-iris-custom-runtime.yaml`](manifests/smoke-test/sklearn-iris-custom-runtime.yaml):
+[`manifests/smoke-test/sklearn-iris-custom-runtime.yaml`](../manifests/smoke-test/sklearn-iris-custom-runtime.yaml):
 same shape as the Step 5c ISVC, deliberately **not** naming a runtime explicitly, to
 prove the override happens automatically rather than because it was forced:
 
@@ -565,7 +551,7 @@ docker rmi custom-sklearn-runtime:latest
 
 ## Step 7: Makefile
 
-[`Makefile`](Makefile) consolidates Steps 1-6 into one target per component
+[`Makefile`](../Makefile) consolidates Steps 1-6 into one target per component
 (`cluster`, `cert-manager`, `kserve-crd`, `kserve-controller`, `kserve-runtimes`,
 `minio`, `postgres`, `mlflow`, `custom-runtime`), chained by `up`:
 
@@ -653,7 +639,7 @@ docker run --rm --gpus all nvidia/cuda:13.0.1-base-ubuntu24.04 nvidia-smi
 k3d runs each node as a Docker container. Passing `--gpus all` gives the *node
 container* the card, but containerd inside it still cannot hand `/dev/nvidia*` to a
 pod, because the stock `rancher/k3s` image carries no NVIDIA container runtime.
-[`gpu/Dockerfile`](gpu/Dockerfile) fixes that: CUDA base image, plus the toolkit,
+[`gpu/Dockerfile`](../gpu/Dockerfile) fixes that: CUDA base image, plus the toolkit,
 with the k3s filesystem overlaid on top. k3s then detects
 `nvidia-container-runtime` on PATH at boot and registers it with containerd as a
 runtime handler named `nvidia`.
@@ -674,7 +660,7 @@ docker exec k3d-kserve-lab-agent-0 \
 
 ### 8c: GPU cluster + device plugin
 
-[`k3d/cluster-gpu.yaml`](k3d/cluster-gpu.yaml) is `cluster.yaml` plus the custom
+[`k3d/cluster-gpu.yaml`](../k3d/cluster-gpu.yaml) is `cluster.yaml` plus the custom
 `image:` and `options.runtime.gpuRequest: all`. The device plugin DaemonSet is what
 makes `nvidia.com/gpu` a schedulable resource; without it the nodes report no GPU
 capacity no matter how well the layers below are wired.
@@ -698,7 +684,7 @@ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}: {.status.capac
 
 ### 8d: LLM `InferenceService`
 
-[`manifests/llm/qwen-gpu.yaml`](manifests/llm/qwen-gpu.yaml) serves
+[`manifests/llm/qwen-gpu.yaml`](../manifests/llm/qwen-gpu.yaml) serves
 `Qwen2.5-1.5B-Instruct`. No `storageUri`: the runtime downloads from HuggingFace
 itself via `--model_id`, so there is no `storage-initializer` init container.
 `modelFormat: huggingface` matches `kserve-huggingfaceserver`, and KServe selects
@@ -804,14 +790,14 @@ The UI is `svc/ml-pipeline-ui` on port 80.
 
 ### 9c: first `TrainJob`
 
-[`manifests/kubeflow/trainjob-iris.yaml`](manifests/kubeflow/trainjob-iris.yaml)
+[`manifests/kubeflow/trainjob-iris.yaml`](../manifests/kubeflow/trainjob-iris.yaml)
 runs the Step 5 script as a pod. A `TrainJob` carries no pod spec of its own: it
 references a `ClusterTrainingRuntime` that owns the topology and pod template, and
 overrides only image, command, env and resources — the same split as
 `InferenceService`/`ServingRuntime`. `torch-distributed` serves as a generic
 single-node executor here (`numNodes: 1`, no command of its own).
 
-[`train/Dockerfile`](train/Dockerfile) bakes in `train.py` **unmodified**: its
+[`train/Dockerfile`](../train/Dockerfile) bakes in `train.py` **unmodified**: its
 `load_dotenv()` is a no-op without a `.env`, so the one script reads a local `.env`
 when run by hand and the TrainJob's `env` block when run as a pod.
 
@@ -830,7 +816,7 @@ Two things that will bite otherwise:
 - **MLflow 3 blocks unknown `Host` headers** (DNS-rebinding protection), so an
   in-cluster caller arriving as `mlflow.kserve-lab.svc.cluster.local` gets
   `403 Invalid Host header`. `MLFLOW_SERVER_ALLOWED_HOSTS` in
-  [`manifests/mlflow/deployment.yaml`](manifests/mlflow/deployment.yaml) fixes it,
+  [`manifests/mlflow/deployment.yaml`](../manifests/mlflow/deployment.yaml) fixes it,
   but setting it **replaces** the defaults — which included the RFC 1918 ranges the
   kubelet's liveness probe relies on. Drop `10.*` from that list and every probe
   gets a 403, the container is killed, and the Deployment CrashLoops while logging
@@ -854,7 +840,7 @@ kubectl run mc-check --rm -i --restart=Never -n kserve-lab \
 ```
 
 The printed `storageUri` is directly usable by an `InferenceService`, the same way
-Step 5 feeds [`manifests/smoke-test/sklearn-iris-mlflow.yaml`](manifests/smoke-test/sklearn-iris-mlflow.yaml).
+Step 5 feeds [`manifests/smoke-test/sklearn-iris-mlflow.yaml`](../manifests/smoke-test/sklearn-iris-mlflow.yaml).
 
 **Rollback:** `kubectl delete -f manifests/kubeflow/trainjob-iris.yaml`. A `TrainJob`
 is not restartable in place — delete and re-apply to re-run it.
@@ -868,7 +854,7 @@ Step 9 runs training in-cluster but still leaves deployment manual: read the
 step chains those into one graph, where the `storageUri` is a value produced at
 runtime and consumed by the next step.
 
-[`pipeline/iris_pipeline.py`](pipeline/iris_pipeline.py) defines it; the Python is
+[`pipeline/iris_pipeline.py`](../pipeline/iris_pipeline.py) defines it; the Python is
 a *build script*, not the thing that runs. Compiling emits an IR YAML that the KFP
 backend turns into an Argo `Workflow`.
 
@@ -884,7 +870,7 @@ consumer receives the contents as an argument.
 
 ### 10a: what the pipeline reuses, and why it parses stdout
 
-The training step runs [`train/train.py`](train/train.py) **unmodified**, the same
+The training step runs [`train/train.py`](../train/train.py) **unmodified**, the same
 script Step 5 runs by hand. Rather than teaching it to emit a machine-readable
 output, the pipeline lifts the line it already prints:
 
@@ -896,14 +882,14 @@ A `sh` wrapper in the component extracts that line into KFP's output file. The
 script stays the single canonical trainer for both contexts; the pipeline adapts
 to it, not the other way round.
 
-Steps 2 and 3 share [`pipeline/Dockerfile`](pipeline/Dockerfile) — the Kubernetes
-client plus [`deploy_isvc.py`](pipeline/deploy_isvc.py) and
-[`smoke_test.py`](pipeline/smoke_test.py). The deploy step creates-or-patches, so
+Steps 2 and 3 share [`pipeline/Dockerfile`](../pipeline/Dockerfile) — the Kubernetes
+client plus [`deploy_isvc.py`](../pipeline/deploy_isvc.py) and
+[`smoke_test.py`](../pipeline/smoke_test.py). The deploy step creates-or-patches, so
 re-running the pipeline updates the model in place instead of failing on conflict.
 
 ### 10b: prerequisites
 
-[`manifests/kubeflow/pipeline-prereqs.yaml`](manifests/kubeflow/pipeline-prereqs.yaml)
+[`manifests/kubeflow/pipeline-prereqs.yaml`](../manifests/kubeflow/pipeline-prereqs.yaml)
 covers two things that are easy to miss, both consequences of the pipeline running
 in `kubeflow` while the model is served from `default`:
 
