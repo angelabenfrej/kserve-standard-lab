@@ -50,6 +50,11 @@ flowchart LR
 - **Training and orchestration.** Training runs in-cluster as a Kubeflow `TrainJob`,
   and a Kubeflow Pipelines DAG trains a model, deploys it as an `InferenceService`,
   and smoke-tests the live endpoint — passing the model URI between steps at runtime.
+- **Scheduling.** A second kube-scheduler running beside the default one, with two
+  profiles that differ only in `NodeResourcesFit`'s scoring strategy:
+  `LeastAllocated` (spreading: the emptiest node wins) and `MostAllocated` (bin
+  packing: the fullest node that still fits wins). They are compared on fake GPUs
+  advertised as a Kubernetes extended resource.
 - **Reproducibility.** One `make` target per stage, pinned versions throughout, and a
   verify-and-rollback procedure for every step.
 
@@ -60,6 +65,7 @@ flowchart LR
 | LLM on the laptop GPU | Qwen2.5-1.5B-Instruct, fp16, on an 8 GB RTX PRO 1000; 2.48 GiB KV cache (92,784 tokens) |
 | First LLM start | ~9.5 min: >10 GB image, ~3 GB of weights, vLLM engine init |
 | Pipeline run | train → deploy → smoke test in 2 min 16 s |
+| Pod placement, 4 pods over 2 nodes | spreading 2 + 2, bin packing 4 + 0 |
 
 The trained model is deliberately trivial (Iris, logistic regression). The subject is
 the platform around it.
@@ -95,6 +101,8 @@ make llm             # serve Qwen on vLLM (GPU path only)
 make kubeflow        # Kubeflow Trainer + Pipelines
 make trainjob        # train in-cluster; prints the run and its model URI
 make pipeline-run    # train → deploy → smoke test, as a KFP pipeline
+
+make sched-demo      # bin packing vs spreading, side by side
 ```
 
 Call the model the pipeline deployed:
@@ -145,6 +153,8 @@ the wrong cause.
 | MLflow rejected in-cluster calls with `403 Invalid Host header` | MLflow 3's DNS-rebinding protection allowlists `Host` headers. |
 | Fixing that made MLflow crash-loop, logging only clean shutdowns | The allowlist variable *replaces* the defaults, including the private IP ranges the kubelet's health probes use. |
 | An sklearn model was served by an unexpected runtime | A namespaced `ServingRuntime` outranks a cluster-wide one at equal priority. |
+| Bin packing gave 2 + 2 instead of 4 + 0 | Deleting a Deployment returns before its pods are gone; the previous test's pods still held half of each node's fake GPUs. |
+| Fake GPUs still schedulable after "removing" them | The kubelet copies an extended resource from `capacity` into `allocatable` but never removes the copy, and the scheduler reads `allocatable`. |
 
 Each is written up in full, with the diagnosis, in the [walkthrough](docs/walkthrough.md).
 
@@ -164,10 +174,10 @@ monitoring for vLLM and KServe metrics.
 ## Repository layout
 
 ```
-Makefile           one target per stage: up, gpu-up, llm, kubeflow, trainjob, pipeline-run
+Makefile           one target per stage: up, gpu-up, llm, kubeflow, trainjob, pipeline-run, sched-demo
 k3d/               cluster configs (CPU: cluster.yaml, GPU: cluster-gpu.yaml)
 gpu/               CUDA-enabled k3s node image, RuntimeClass, NVIDIA device plugin
-manifests/         MinIO, PostgreSQL, MLflow, serving runtimes, InferenceServices, Kubeflow jobs
+manifests/         MinIO, PostgreSQL, MLflow, serving runtimes, InferenceServices, Kubeflow jobs, scheduler
 mlflow/            MLflow server image
 custom-runtime/    custom KServe ServingRuntime image
 train/             training script and its TrainJob image

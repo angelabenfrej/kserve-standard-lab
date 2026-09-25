@@ -10,6 +10,7 @@ and how to **roll it back**.
 | 8 | GPU passthrough into k3d, and LLM serving on vLLM |
 | 9 | in-cluster training with Kubeflow Trainer, plus Kubeflow Pipelines |
 | 10 | a pipeline chaining train → deploy → smoke-test |
+| 11 | scheduling: bin packing vs spreading, with a second scheduler and fake GPUs |
 
 Prerequisites and the quickstart are in the [README](../README.md#quickstart). The
 diagram below covers Steps 1–7; the README has one for the full platform.
@@ -566,7 +567,7 @@ part of `up`; they're interactive exercises (local venv, foreground port-forward
 not infrastructure. `up` gets the lab ready to use; training/serving a model is a
 manual walkthrough, documented above.
 
-### Targets for Steps 8-10
+### Targets for Steps 8-11
 
 The later steps have their own targets, each opt-in and none chained into `up`:
 
@@ -577,6 +578,7 @@ The later steps have their own targets, each opt-in and none chained into `up`:
 | `kubeflow` | 9 | Trainer (+ its runtimes) and Pipelines, waiting for each to be Available |
 | `trainjob` | 9 | build the training image and run the iris `TrainJob` to completion |
 | `pipeline-run` | 10 | compile if changed, build images, apply prerequisites, run the pipeline |
+| `sched-demo` / `sched-down` | 11 | run the bin-packing vs spreading comparison / remove the scheduler and fake GPUs |
 
 ```bash
 make gpu-up              # instead of `make up`, for the GPU variant of the lab
@@ -970,3 +972,108 @@ there.
 kubectl delete isvc iris-pipeline
 kubectl delete -f manifests/kubeflow/pipeline-prereqs.yaml
 ```
+
+---
+
+## Step 11: Scheduling: bin packing vs spreading
+
+Every pod in the lab so far was placed by the default kube-scheduler built into
+k3s, untouched. Its scoring strategy is **spreading**: `NodeResourcesFit` uses
+`LeastAllocated`, so a new pod goes to the node with the most room left. The
+alternative is **bin packing**, `MostAllocated`: fill the fullest node that still
+fits, so other nodes stay empty and could be shut down. This step puts the two
+side by side.
+
+Bin packing and spreading decide **where** a pod goes, and that is the scheduler's
+job alone. Queueing systems such as Kueue decide **when** a job may start; they
+never choose a node, so they are not part of this step.
+
+### 11a: a second scheduler instead of reconfiguring the default
+
+k3s only accepts scheduler configuration at cluster creation, so changing the
+default scheduler means rebuilding the cluster. Kubernetes also supports running
+**additional schedulers**, and a pod chooses one with `spec.schedulerName`.
+[`manifests/scheduling/scheduler.yaml`](../manifests/scheduling/scheduler.yaml)
+runs `registry.k8s.io/kube-scheduler:v1.35.5` (matching the cluster's version) as
+a Deployment in `kube-system`, with two profiles:
+
+| Profile | `NodeResourcesFit` strategy | Prefers |
+| --- | --- | --- |
+| `spread-scheduler` | `LeastAllocated` | the emptiest node that fits |
+| `binpack-scheduler` | `MostAllocated` | the fullest node that fits |
+
+Everything else in the cluster stays on the default scheduler. Removing this is a
+single `kubectl delete`.
+
+**The profiles differ only in that one setting.** Both switch off the same three
+score plugins, because each can spread pods by itself and would muddy the result:
+`NodeResourcesBalancedAllocation` (favours even CPU/memory ratios),
+`PodTopologySpread` (by default spreads a Deployment's replicas across nodes), and
+`ImageLocality` (favours nodes that already hold the image).
+
+It runs as a single replica with leader election off. With leader election on, it
+would need a lease that the built-in `system:kube-scheduler` role only grants
+under the default scheduler's own name.
+
+### 11b: fake GPUs, so the real card is never involved
+
+The comparison needs a resource to count. Kubernetes lets you advertise a made-up
+**extended resource** by patching a node's status; pods request it and the
+scheduler treats it exactly like a GPU:
+
+```bash
+kubectl patch node <node> --subresource=status --type=json \
+  -p '[{"op":"add","path":"/status/capacity/example.com~1fake-gpu","value":"4"}]'
+```
+
+`~1` is JSON Patch's escape for the `/` in `example.com/fake-gpu`. The kubelet
+copies `capacity` into `allocatable`, which is the field the scheduler reads.
+`example.com/fake-gpu` is weighted 5 against 1 each for CPU and memory in both
+profiles, so the resource being counted decides placement rather than the uneven
+background load the two nodes already carry.
+
+The test workloads,
+[`placement-spread.yaml`](../manifests/scheduling/placement-spread.yaml) and
+[`placement-binpack.yaml`](../manifests/scheduling/placement-binpack.yaml), are
+identical except for `schedulerName`: 4 replicas, each asking for one fake GPU,
+running the `pause` image that is already on every node, so no image pull can
+delay or skew a placement.
+
+### 11c: running it
+
+```bash
+make sched-demo      # advertises the fake GPUs, starts the scheduler, runs both
+```
+
+**Verify:** with 4 fake GPUs on each of the 2 nodes:
+
+```
+spread-scheduler:  k3d-kserve-lab-agent-0=2  k3d-kserve-lab-server-0=2
+binpack-scheduler: k3d-kserve-lab-agent-0=4
+```
+
+Spreading alternates between nodes, because after each placement the node that
+took the pod is fuller. Bin packing keeps choosing the node it started filling
+until that node has no fake GPU left. Which node it fills first depends on the
+two nodes' existing CPU and memory load; the shape, 4 + 0, does not.
+
+### Two traps this step hit
+
+- **Deleting a Deployment does not wait for its pods.** `kubectl delete --wait`
+  returns once the Deployment object is gone; its pods are removed afterwards, in
+  the background. Run the two tests back to back without waiting for the pods,
+  and the spread pods are still holding 2 fake GPUs per node when the bin-packing
+  pods arrive, which turns 4 + 0 into 2 + 2. `sched-demo` waits with
+  `kubectl wait --for=delete pod -l ...` between runs.
+- **Removing an extended resource needs two fields cleared.** Removing it from
+  `capacity` leaves `allocatable` at 4: the kubelet copies the value when the
+  resource is added but does not remove the copy. The node then still offers fake
+  GPUs to the scheduler. `sched-down` removes both, and the removal is only
+  trustworthy when a probe pod fails to schedule:
+
+```
+0/2 nodes are available: 2 Insufficient example.com/fake-gpu.
+```
+
+**Rollback:** `make sched-down` removes the demo workloads, the scheduler and its
+permissions, and the fake resource from every node.

@@ -11,12 +11,17 @@ KFP_SDK_VERSION := 2.17.0
 KFP_PORT ?= 8888
 VENV := .venv
 
+# Step 11. The placement demos run 4 replicas; with 4 fake GPUs per node the
+# expected result is 2 + 2 (spread) and 4 + 0 (bin packing).
+FAKE_GPUS_PER_NODE := 4
+
 .PHONY: up down reset \
 	cluster cert-manager kserve-crd kserve-controller kserve-runtimes \
 	minio postgres mlflow custom-runtime \
 	gpu-up gpu-image gpu-cluster gpu-plugin llm llm-down \
 	kubeflow kubeflow-trainer kubeflow-pipelines trainer-image trainjob \
-	venv pipeline-image pipeline-prereqs pipeline-compile pipeline-run
+	venv pipeline-image pipeline-prereqs pipeline-compile pipeline-run \
+	sched-up sched-demo sched-down
 
 up: cluster cert-manager kserve-crd kserve-controller kserve-runtimes \
 	minio postgres mlflow custom-runtime
@@ -201,3 +206,51 @@ pipeline-run: pipeline-compile pipeline-image trainer-image pipeline-prereqs
 		sleep 1; \
 	done; \
 	KFP_HOST=http://localhost:$(KFP_PORT) $(VENV)/bin/python pipeline/run_pipeline.py
+
+# --- Step 11: scheduling -- bin packing vs spreading ---
+# Advertises a made-up extended resource on every node and runs a second
+# kube-scheduler with a spread profile and a bin-packing profile. Nothing else in
+# the cluster changes: all other pods stay on the default scheduler, and the real
+# GPU is never touched.
+sched-up:
+	@for n in $$(kubectl get nodes -o name); do \
+		kubectl patch $$n --subresource=status --type=json \
+			-p '[{"op":"add","path":"/status/capacity/example.com~1fake-gpu","value":"$(FAKE_GPUS_PER_NODE)"}]'; \
+	done
+	kubectl apply -f manifests/scheduling/scheduler.yaml
+	kubectl rollout status deploy/lab-scheduler -n kube-system --timeout=180s
+
+# Runs each profile in turn and prints pods per node. Each run waits for its
+# pods -- not just the Deployment -- to be gone before the next starts: deleting
+# a Deployment returns while its pods are still terminating and holding their
+# fake GPUs, which is enough to turn a 4 + 0 bin-packing result into 2 + 2.
+sched-demo: sched-up
+	@for mode in spread binpack; do \
+		kubectl apply -f manifests/scheduling/placement-$$mode.yaml >/dev/null; \
+		kubectl rollout status deploy/placement-$$mode --timeout=120s >/dev/null; \
+		printf '%-18s ' "$$mode-scheduler:"; \
+		kubectl get pods -l app=placement-$$mode \
+			-o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' \
+			| sort | uniq -c | awk '{printf "%s=%s  ", $$2, $$1} END {print ""}'; \
+		kubectl delete -f manifests/scheduling/placement-$$mode.yaml >/dev/null; \
+		kubectl wait --for=delete pod -l app=placement-$$mode --timeout=60s >/dev/null 2>&1; \
+	done
+
+# Removes the demo, the scheduler, and the fake resource from every node.
+#
+# `capacity` and `allocatable` are removed separately, and both are needed. When
+# the resource is added, the kubelet copies capacity into allocatable, but it does
+# not remove that copy when capacity goes: clearing capacity alone leaves the node
+# still offering 4 fake GPUs to the scheduler, which reads allocatable. Two
+# patches rather than one because a JSON patch fails whole if any path is absent.
+sched-down:
+	kubectl delete -f manifests/scheduling/placement-spread.yaml \
+		-f manifests/scheduling/placement-binpack.yaml --ignore-not-found
+	kubectl delete -f manifests/scheduling/scheduler.yaml --ignore-not-found
+	@for n in $$(kubectl get nodes -o name); do \
+		for field in capacity allocatable; do \
+			kubectl patch $$n --subresource=status --type=json \
+				-p "[{\"op\":\"remove\",\"path\":\"/status/$$field/example.com~1fake-gpu\"}]" >/dev/null 2>&1 || true; \
+		done; \
+	done
+	@kubectl get nodes -o custom-columns='NODE:.metadata.name,FAKE-GPU-ALLOCATABLE:.status.allocatable.example\.com/fake-gpu'

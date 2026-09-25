@@ -1,0 +1,31 @@
+# Four pods, each wanting one fake GPU, placed by the binpack-scheduler profile.
+# Identical to placement-spread.yaml except for the name and schedulerName.
+#
+# With 4 fake GPUs per node, expect 4 + 0: MostAllocated keeps choosing the node
+# it already started filling until that node has no fake GPU left.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: placement-binpack
+  namespace: default
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: placement-binpack
+  template:
+    metadata:
+      labels:
+        app: placement-binpack
+    spec:
+      schedulerName: binpack-scheduler
+      containers:
+        - name: pause
+          image: rancher/mirrored-pause:3.6
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 16Mi
+              example.com/fake-gpu: 1

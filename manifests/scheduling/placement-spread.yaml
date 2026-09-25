@@ -1,0 +1,38 @@
+# Four pods, each wanting one fake GPU, placed by the spread-scheduler profile.
+# Identical to placement-binpack.yaml except for the name and schedulerName, so
+# any difference in where the pods land comes from the scoring strategy alone.
+#
+# With 4 fake GPUs per node, expect 2 + 2: after each placement the node that
+# took the pod is fuller, so LeastAllocated sends the next one to the other node.
+#
+# The pause image does nothing and is already on every node (k3s uses it for
+# each pod's sandbox), so there is no image pull to delay or skew placement.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: placement-spread
+  namespace: default
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: placement-spread
+  template:
+    metadata:
+      labels:
+        app: placement-spread
+    spec:
+      schedulerName: spread-scheduler
+      containers:
+        - name: pause
+          image: rancher/mirrored-pause:3.6
+          resources:
+            # Extended resources cannot be overcommitted, so they go in limits
+            # (requests default to the same value). CPU and memory are kept tiny
+            # so they barely move the node scores.
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 16Mi
+              example.com/fake-gpu: 1
