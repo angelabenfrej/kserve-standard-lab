@@ -140,24 +140,6 @@ Tear down with `make llm-down` (frees the GPU) or `make down` (deletes the clust
 - **Pinned image tags.** Adopted after the upstream MinIO images disappeared from
   Docker Hub and broke a `:latest` reference without warning.
 
-## Engineering notes
-
-The problems that took real diagnosis — most of them failed silently or pointed at
-the wrong cause.
-
-| Symptom | Root cause |
-| --- | --- |
-| GPU visible to the node container, but not to pods | The stock k3s image has no NVIDIA container runtime, so containerd cannot hand the device to a pod. Fixed with a CUDA-based k3s node image. |
-| LLM would run out of GPU memory with no hint why | vLLM's flags are dashed while KServe's are underscored, and the server parses with `parse_known_args()`, so a misspelled flag is silently dropped and vLLM falls back to its defaults. |
-| MinIO in `ImagePullBackOff`, with DNS and timeout errors | Not a network fault: the repository had been removed from Docker Hub. Moved to quay.io and pinned. |
-| MLflow rejected in-cluster calls with `403 Invalid Host header` | MLflow 3's DNS-rebinding protection allowlists `Host` headers. |
-| Fixing that made MLflow crash-loop, logging only clean shutdowns | The allowlist variable *replaces* the defaults, including the private IP ranges the kubelet's health probes use. |
-| An sklearn model was served by an unexpected runtime | A namespaced `ServingRuntime` outranks a cluster-wide one at equal priority. |
-| Bin packing gave 2 + 2 instead of 4 + 0 | Deleting a Deployment returns before its pods are gone; the previous test's pods still held half of each node's fake GPUs. |
-| Fake GPUs still schedulable after "removing" them | The kubelet copies an extended resource from `capacity` into `allocatable` but never removes the copy, and the scheduler reads `allocatable`. |
-
-Each is written up in full, with the diagnosis, in the [walkthrough](docs/walkthrough.md).
-
 ## Limitations and next steps
 
 - **No ingress yet.** Models are reached by port-forward; ports 80/443 are reserved
