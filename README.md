@@ -50,6 +50,11 @@ flowchart LR
 - **Training and orchestration.** Training runs in-cluster as a Kubeflow `TrainJob`,
   and a Kubeflow Pipelines DAG trains a model, deploys it as an `InferenceService`,
   and smoke-tests the live endpoint — passing the model URI between steps at runtime.
+- **Scheduling.** A second kube-scheduler running beside the default one, with two
+  profiles that differ only in `NodeResourcesFit`'s scoring strategy:
+  `LeastAllocated` (spreading: the emptiest node wins) and `MostAllocated` (bin
+  packing: the fullest node that still fits wins). They are compared on fake GPUs
+  advertised as a Kubernetes extended resource.
 - **Reproducibility.** One `make` target per stage, pinned versions throughout, and a
   verify-and-rollback procedure for every step.
 
@@ -60,6 +65,7 @@ flowchart LR
 | LLM on the laptop GPU | Qwen2.5-1.5B-Instruct, fp16, on an 8 GB RTX PRO 1000; 2.48 GiB KV cache (92,784 tokens) |
 | First LLM start | ~9.5 min: >10 GB image, ~3 GB of weights, vLLM engine init |
 | Pipeline run | train → deploy → smoke test in 2 min 16 s |
+| Pod placement, 4 pods over 2 nodes | spreading 2 + 2, bin packing 4 + 0 |
 
 The trained model is deliberately trivial (Iris, logistic regression). The subject is
 the platform around it.
@@ -95,6 +101,8 @@ make llm             # serve Qwen on vLLM (GPU path only)
 make kubeflow        # Kubeflow Trainer + Pipelines
 make trainjob        # train in-cluster; prints the run and its model URI
 make pipeline-run    # train → deploy → smoke test, as a KFP pipeline
+
+make sched-demo      # bin packing vs spreading, side by side
 ```
 
 Call the model the pipeline deployed:
@@ -132,22 +140,6 @@ Tear down with `make llm-down` (frees the GPU) or `make down` (deletes the clust
 - **Pinned image tags.** Adopted after the upstream MinIO images disappeared from
   Docker Hub and broke a `:latest` reference without warning.
 
-## Engineering notes
-
-The problems that took real diagnosis — most of them failed silently or pointed at
-the wrong cause.
-
-| Symptom | Root cause |
-| --- | --- |
-| GPU visible to the node container, but not to pods | The stock k3s image has no NVIDIA container runtime, so containerd cannot hand the device to a pod. Fixed with a CUDA-based k3s node image. |
-| LLM would run out of GPU memory with no hint why | vLLM's flags are dashed while KServe's are underscored, and the server parses with `parse_known_args()`, so a misspelled flag is silently dropped and vLLM falls back to its defaults. |
-| MinIO in `ImagePullBackOff`, with DNS and timeout errors | Not a network fault: the repository had been removed from Docker Hub. Moved to quay.io and pinned. |
-| MLflow rejected in-cluster calls with `403 Invalid Host header` | MLflow 3's DNS-rebinding protection allowlists `Host` headers. |
-| Fixing that made MLflow crash-loop, logging only clean shutdowns | The allowlist variable *replaces* the defaults, including the private IP ranges the kubelet's health probes use. |
-| An sklearn model was served by an unexpected runtime | A namespaced `ServingRuntime` outranks a cluster-wide one at equal priority. |
-
-Each is written up in full, with the diagnosis, in the [walkthrough](docs/walkthrough.md).
-
 ## Limitations and next steps
 
 - **No ingress yet.** Models are reached by port-forward; ports 80/443 are reserved
@@ -164,10 +156,10 @@ monitoring for vLLM and KServe metrics.
 ## Repository layout
 
 ```
-Makefile           one target per stage: up, gpu-up, llm, kubeflow, trainjob, pipeline-run
+Makefile           one target per stage: up, gpu-up, llm, kubeflow, trainjob, pipeline-run, sched-demo
 k3d/               cluster configs (CPU: cluster.yaml, GPU: cluster-gpu.yaml)
 gpu/               CUDA-enabled k3s node image, RuntimeClass, NVIDIA device plugin
-manifests/         MinIO, PostgreSQL, MLflow, serving runtimes, InferenceServices, Kubeflow jobs
+manifests/         MinIO, PostgreSQL, MLflow, serving runtimes, InferenceServices, Kubeflow jobs, scheduler
 mlflow/            MLflow server image
 custom-runtime/    custom KServe ServingRuntime image
 train/             training script and its TrainJob image
